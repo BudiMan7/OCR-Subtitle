@@ -41,6 +41,11 @@
           "run": "flutter build apk --release"
         },
         {
+          "name": "Periksa integritas APK",
+          "shell": "bash",
+          "run": "set -euo pipefail\nAPK=\"build/app/outputs/flutter-apk/app-release.apk\"\ntest -s \"$APK\"\nunzip -t \"$APK\"\nsha256sum \"$APK\"\necho \"APK lolos pemeriksaan ZIP.\""
+        },
+        {
           "uses": "actions/upload-artifact@v4",
           "with": {
             "name": "HardsubOCR-apk",
