@@ -1,0 +1,45 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Siapkan proyek Android
+        run: |
+          flutter create --org com.hardsub --project-name hardsub_ocr --platforms=android .
+          bash patch.sh
+          flutter pub get
+
+      - name: Build APK
+        run: flutter build apk --release --target-platform android-arm64 --no-shrink
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HardsubOCR-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Buat rilis (agar APK bisa diunduh langsung dari HP)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Hardsub OCR build ${{ github.run_number }}
+          files: build/app/outputs/flutter-apk/app-release.apk

@@ -1,0 +1,15 @@
+name: hardsub_ocr
+description: Hardsub OCR ke SRT (hanya huruf Latin)
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  google_mlkit_text_recognition: '>=0.13.0 <1.0.0'
+
+flutter:
+  uses-material-design: true
