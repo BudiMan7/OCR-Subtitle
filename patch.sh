@@ -32,3 +32,22 @@ if [ -z "$KT" ]; then
   echo "MainActivity.kt tidak ditemukan"; find android/app/src/main -type f | head -30; exit 1
 fi
 PKG=$(grep -m1 '^package ' "$KT")
+
+if [ -z "$PKG" ]; then
+  echo "GAGAL: package MainActivity tidak ditemukan"
+  exit 1
+fi
+
+# Pasang MainActivity dengan package yang sesuai proyek Flutter.
+sed "s/^package placeholder$/$PKG/" MainActivity.kt > "$KT"
+
+echo "--- Verifikasi MainActivity terpasang ---"
+grep -n "package " "$KT"
+grep -n 'MethodChannel' "$KT"
+grep -n '"pick" ->' "$KT"
+
+if ! grep -q '"pick" ->' "$KT"; then
+  echo "GAGAL: implementasi method pick tidak ditemukan"
+  exit 1
+fi
+
