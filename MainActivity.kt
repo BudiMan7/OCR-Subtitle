@@ -29,6 +29,7 @@ import io.flutter.plugin.common.MethodChannel
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.charset.Charset
 import java.util.concurrent.Executors
 
 private const val NOTIF_CHANNEL = "ocr_progress"
@@ -99,17 +100,72 @@ class OcrService : Service() {
     }
 }
 
+/** Statistik satu kotak teks pada gambar abu-abu: porsi piksel teks, porsi bertepi gelap (outline), dan teks di sisi kiri/kanan kotak. */
+private fun boxStat(g: ByteArray, w: Int, h: Int, l0: Int, t0: Int, r0: Int, b0: Int, light: Boolean, bright: Int): Map<String, Double> {
+    if (w <= 1 || h <= 1) return mapOf("fill" to -1.0, "outline" to -1.0, "extL" to 0.0, "extR" to 0.0)
+    val l = l0.coerceIn(0, w - 1)
+    val t = t0.coerceIn(0, h - 1)
+    val r = r0.coerceIn(l + 1, w)
+    val b = b0.coerceIn(t + 1, h)
+    val bh = b - t
+    val rad = maxOf(2, bh / 14)
+    val ext = maxOf(8, (bh * 2.5).toInt())
+    fun lumAt(x: Int, y: Int): Int = g[y * w + x].toInt() and 255
+    fun isText(x: Int, y: Int): Boolean = if (light) lumAt(x, y) >= bright else lumAt(x, y) <= 255 - bright
+    fun isDark(x: Int, y: Int): Boolean = if (light) lumAt(x, y) <= 80 else lumAt(x, y) >= 175
+    var text = 0
+    var withEdge = 0
+    for (y in t until b) {
+        for (x in l until r) {
+            if (!isText(x, y)) continue
+            text++
+            var found = false
+            for (dy in -1..1) {
+                for (dx in -1..1) {
+                    if (dx == 0 && dy == 0) continue
+                    for (m in 1..3) {
+                        val xx = x + dx * rad * m
+                        val yy = y + dy * rad * m
+                        if (xx >= 0 && xx < w && yy >= 0 && yy < h && isDark(xx, yy)) found = true
+                    }
+                }
+            }
+            if (found) withEdge++
+        }
+    }
+    fun strip(x0: Int, x1: Int): Double {
+        if (x1 - x0 < 4) return 0.0
+        var c = 0
+        for (y in t until b) {
+            for (x in x0 until x1) {
+                if (isText(x, y)) c++
+            }
+        }
+        return c.toDouble() / ((x1 - x0) * bh)
+    }
+    val area = (r - l) * bh
+    return mapOf(
+        "fill" to text.toDouble() / area,
+        "outline" to (if (text > 20) withEdge.toDouble() / text else -1.0),
+        "extL" to strip(maxOf(0, l - ext), l),
+        "extR" to strip(r, minOf(w, r + ext))
+    )
+}
+
 class MainActivity : FlutterActivity() {
     private val channelName = "hardsub/native"
     private val pickCode = 4711
+    private val textCode = 4713
     private var pendingPick: MethodChannel.Result? = null
+    private var pendingText: MethodChannel.Result? = null
     private var retriever: MediaMetadataRetriever? = null
     private val worker = Executors.newSingleThreadExecutor()
 
-    private var prevGray: ByteArray? = null
-    private var lastGray: ByteArray? = null
-    private var lastW = 0
-    private var lastH = 0
+    // keadaan per area OCR (kunci = id area)
+    private val prevMask = HashMap<Int, ByteArray>()
+    private val lastGrayMap = HashMap<Int, ByteArray>()
+    private val lastWMap = HashMap<Int, Int>()
+    private val lastHMap = HashMap<Int, Int>()
     private var lastLight = true
     private var lastBright = 200
     private var vidW = 0
@@ -162,7 +218,7 @@ class MainActivity : FlutterActivity() {
                         val r = MediaMetadataRetriever()
                         r.setDataSource(this@MainActivity, uri)
                         retriever = r
-                        prevGray = null
+                        prevMask.clear()
                         val dur = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
                         var w = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
                         var h = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
@@ -215,13 +271,9 @@ class MainActivity : FlutterActivity() {
             }
             "grab" -> {
                 val tMs = num(call, "timeMs").toLong()
-                val x0 = num(call, "x0").toDouble()
-                val y0 = num(call, "y0").toDouble()
-                val x1 = num(call, "x1").toDouble()
-                val y1 = num(call, "y1").toDouble()
+                val areas = call.argument<List<Map<String, Any>>>("areas")!!
                 val light = call.argument<Boolean>("light") ?: true
                 val bright = num(call, "bright").toInt()
-                val minFrac = num(call, "minFrac").toDouble()
                 val changeFrac = num(call, "changeFrac").toDouble()
                 val force = call.argument<Boolean>("force") ?: false
                 worker.execute {
@@ -229,91 +281,137 @@ class MainActivity : FlutterActivity() {
                         val r = retriever ?: throw IllegalStateException("Video belum dibuka")
                         val full = frameAt(r, tMs * 1000)
                         if (full == null) {
-                            ok(result, mapOf("ok" to false))
+                            ok(result, areas.map { mapOf("id" to (it["id"] as Number).toInt(), "ok" to false) })
                             return@execute
                         }
                         val fw = full.width
                         val fh = full.height
-                        val cx = (x0 * fw).toInt().coerceIn(0, fw - 16)
-                        val cy = (y0 * fh).toInt().coerceIn(0, fh - 8)
-                        val cw = ((x1 - x0) * fw).toInt().coerceIn(16, fw - cx)
-                        val ch = ((y1 - y0) * fh).toInt().coerceIn(8, fh - cy)
-                        val crop = Bitmap.createBitmap(full, cx, cy, cw, ch)
-                        val px = IntArray(cw * ch)
-                        crop.getPixels(px, 0, cw, 0, 0, cw, ch)
-                        val gray = ByteArray(cw * ch)
-                        val mask = ByteArray(cw * ch)
-                        var cnt = 0
-                        for (i in px.indices) {
-                            val p = px[i]
-                            val lum = (((p shr 16) and 255) * 299 + ((p shr 8) and 255) * 587 + (p and 255) * 114) / 1000
-                            gray[i] = lum.toByte()
-                            if (if (light) lum >= bright else lum <= 255 - bright) {
-                                cnt++
-                                mask[i] = 1
-                            }
-                        }
-                        val frac = cnt.toDouble() / px.size
-                        var changed = -1.0
-                        val pg = prevGray
-                        if (pg != null && pg.size == gray.size) {
-                            var d = 0
-                            for (i in mask.indices) {
-                                if (mask[i] != pg[i]) d++
-                            }
-                            changed = d.toDouble() / mask.size
-                        }
-                        prevGray = mask
-                        lastGray = gray
-                        lastW = cw
-                        lastH = ch
                         lastLight = light
                         lastBright = bright
-                        var path: String? = null
-                        val need = force || (frac >= minFrac && (changed < 0 || changed >= changeFrac))
-                        if (need) {
-                            val f = File(cacheDir, "crop_raw.png")
-                            FileOutputStream(f).use { crop.compress(Bitmap.CompressFormat.PNG, 100, it) }
-                            path = f.absolutePath
+                        val out = ArrayList<Map<String, Any?>>()
+                        for (a in areas) {
+                            val id = (a["id"] as Number).toInt()
+                            val x0 = (a["x0"] as Number).toDouble()
+                            val x1 = (a["x1"] as Number).toDouble()
+                            val y0 = (a["y0"] as Number).toDouble()
+                            val y1 = (a["y1"] as Number).toDouble()
+                            val minFrac = (a["minFrac"] as Number).toDouble()
+                            val cx = (x0 * fw).toInt().coerceIn(0, fw - 16)
+                            val cy = (y0 * fh).toInt().coerceIn(0, fh - 8)
+                            val cw = ((x1 - x0) * fw).toInt().coerceIn(16, fw - cx)
+                            val ch = ((y1 - y0) * fh).toInt().coerceIn(8, fh - cy)
+                            val crop = Bitmap.createBitmap(full, cx, cy, cw, ch)
+                            val px = IntArray(cw * ch)
+                            crop.getPixels(px, 0, cw, 0, 0, cw, ch)
+                            val gray = ByteArray(cw * ch)
+                            val mask = ByteArray(cw * ch)
+                            var cnt = 0
+                            for (i in px.indices) {
+                                val p = px[i]
+                                val lum = (((p shr 16) and 255) * 299 + ((p shr 8) and 255) * 587 + (p and 255) * 114) / 1000
+                                gray[i] = lum.toByte()
+                                if (if (light) lum >= bright else lum <= 255 - bright) {
+                                    cnt++
+                                    mask[i] = 1
+                                }
+                            }
+                            val frac = cnt.toDouble() / px.size
+                            var changed = -1.0
+                            val pg = prevMask[id]
+                            if (pg != null && pg.size == mask.size) {
+                                var d = 0
+                                for (i in mask.indices) {
+                                    if (mask[i] != pg[i]) d++
+                                }
+                                changed = d.toDouble() / mask.size
+                            }
+                            prevMask[id] = mask
+                            lastGrayMap[id] = gray
+                            lastWMap[id] = cw
+                            lastHMap[id] = ch
+                            var path: String? = null
+                            val need = force || (frac >= minFrac && (changed < 0 || changed >= changeFrac))
+                            if (need) {
+                                val f = File(cacheDir, "crop_raw_$id.png")
+                                FileOutputStream(f).use { crop.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                                path = f.absolutePath
+                            }
+                            if (crop !== full) crop.recycle()
+                            out.add(
+                                mapOf(
+                                    "id" to id, "ok" to true, "frac" to frac, "changed" to changed, "path" to path,
+                                    "cw" to cw, "ch" to ch,
+                                    "nx0" to cx.toDouble() / fw, "ny0" to cy.toDouble() / fh,
+                                    "nx1" to (cx + cw).toDouble() / fw, "ny1" to (cy + ch).toDouble() / fh
+                                )
+                            )
                         }
-                        if (crop !== full) crop.recycle()
                         full.recycle()
-                        ok(result, mapOf("ok" to true, "frac" to frac, "changed" to changed, "path" to path, "cw" to cw, "ch" to ch))
+                        ok(result, out)
                     } catch (e: Throwable) {
                         fail(result, "grab", e)
                     }
                 }
             }
             "binarize" -> {
+                val id = num(call, "id").toInt()
                 worker.execute {
                     try {
-                        val g = lastGray ?: throw IllegalStateException("Belum ada frame")
-                        val scale = if (lastW > 900) 1 else 2
+                        val g = lastGrayMap[id] ?: throw IllegalStateException("Belum ada frame")
+                        val lw = lastWMap[id] ?: 0
+                        val lh = lastHMap[id] ?: 0
+                        val scale = if (lw > 900) 1 else 2
                         val pad = 10
-                        val w2 = lastW * scale + pad * 2
-                        val h2 = lastH * scale + pad * 2
+                        val w2 = lw * scale + pad * 2
+                        val h2 = lh * scale + pad * 2
                         val out = IntArray(w2 * h2) { Color.WHITE }
-                        for (yy in 0 until lastH * scale) {
+                        for (yy in 0 until lh * scale) {
                             val sy = yy / scale
-                            for (xx in 0 until lastW * scale) {
-                                val lum = g[sy * lastW + xx / scale].toInt() and 255
+                            for (xx in 0 until lw * scale) {
+                                val lum = g[sy * lw + xx / scale].toInt() and 255
                                 val isText = if (lastLight) lum >= lastBright else lum <= 255 - lastBright
                                 if (isText) out[(yy + pad) * w2 + xx + pad] = Color.BLACK
                             }
                         }
                         val bmp = Bitmap.createBitmap(w2, h2, Bitmap.Config.ARGB_8888)
                         bmp.setPixels(out, 0, w2, 0, 0, w2, h2)
-                        val f = File(cacheDir, "crop_bin.png")
+                        val f = File(cacheDir, "crop_bin_$id.png")
                         FileOutputStream(f).use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
                         bmp.recycle()
-                        ok(result, f.absolutePath)
+                        ok(result, mapOf("path" to f.absolutePath, "scale" to scale, "pad" to pad, "w" to w2, "h" to h2))
                     } catch (e: Throwable) {
                         fail(result, "binarize", e)
                     }
                 }
             }
+            "boxStats" -> {
+                val id = num(call, "id").toInt()
+                val boxes = call.argument<List<List<Number>>>("boxes")!!
+                worker.execute {
+                    try {
+                        val g = lastGrayMap[id] ?: throw IllegalStateException("Belum ada frame")
+                        val w = lastWMap[id] ?: 0
+                        val h = lastHMap[id] ?: 0
+                        val out = ArrayList<Map<String, Double>>()
+                        for (b in boxes) {
+                            out.add(boxStat(g, w, h, b[0].toInt(), b[1].toInt(), b[2].toInt(), b[3].toInt(), lastLight, lastBright))
+                        }
+                        ok(result, out)
+                    } catch (e: Throwable) {
+                        fail(result, "boxStats", e)
+                    }
+                }
+            }
+            "pickText" -> {
+                pendingText = result
+                val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                    type = "*/*"
+                }
+                startActivityForResult(i, textCode)
+            }
             "resetPrev" -> {
-                prevGray = null
+                prevMask.clear()
                 result.success(null)
             }
             "keepAwake" -> {
@@ -413,6 +511,32 @@ class MainActivity : FlutterActivity() {
                 } catch (_: Throwable) {
                 }
                 res?.success(uri.toString())
+            } else {
+                res?.success(null)
+            }
+        } else if (requestCode == textCode) {
+            val res = pendingText
+            pendingText = null
+            val uri = data?.data
+            if (resultCode == RESULT_OK && uri != null) {
+                worker.execute {
+                    try {
+                        val bytes = contentResolver.openInputStream(uri)!!.use { it.readBytes() }
+                        if (bytes.size > 8 * 1024 * 1024) throw IllegalStateException("File terlalu besar untuk subtitle")
+                        var txt = String(bytes, Charsets.UTF_8)
+                        if (txt.indexOf(0xFFFD.toChar()) >= 0) txt = String(bytes, Charset.forName("windows-1252"))
+                        var nm = "subtitle.srt"
+                        contentResolver.query(uri, null, null, null, null)?.use { c ->
+                            if (c.moveToFirst()) {
+                                val ni = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                                if (ni >= 0) nm = c.getString(ni) ?: nm
+                            }
+                        }
+                        ok(res!!, mapOf("name" to nm, "text" to txt))
+                    } catch (e: Throwable) {
+                        runOnUiThread { res?.error("pickText", e.message ?: e.toString(), null) }
+                    }
+                }
             } else {
                 res?.success(null)
             }
