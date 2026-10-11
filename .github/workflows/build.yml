@@ -37,20 +37,14 @@
           "run": "flutter create --org com.hardsub --project-name hardsub_ocr --platforms=android .\nbash patch.sh\nflutter pub get"
         },
         {
-          "name": "Build APK",
-          "run": "flutter build apk --release"
+          "name": "Build APK per jenis prosesor",
+          "run": "flutter build apk --release --split-per-abi"
         },
         {
-          "name": "Periksa integritas APK",
+          "name": "Periksa APK",
           "shell": "bash",
-          "run": "set -euo pipefail\nAPK=\"build/app/outputs/flutter-apk/app-release.apk\"\ntest -s \"$APK\"\nunzip -t \"$APK\"\nsha256sum \"$APK\"\necho \"APK lolos pemeriksaan ZIP.\""
-        },
-        {
-          "uses": "actions/upload-artifact@v4",
-          "with": {
-            "name": "HardsubOCR-apk",
-            "path": "build/app/outputs/flutter-apk/app-release.apk"
-          }
+          "continue-on-error": true,
+          "run": "set -u\nBT=$(ls -d \"${ANDROID_SDK_ROOT:-$ANDROID_HOME}\"/build-tools/* | sort -V | tail -1)\nfor APK in build/app/outputs/flutter-apk/*.apk; do\n  echo \"=== $APK ===\"\n  ls -l \"$APK\"\n  unzip -tq \"$APK\"\n  \"$BT/apksigner\" verify --verbose --print-certs \"$APK\" | head -12\n  \"$BT/aapt2\" dump badging \"$APK\" | grep -E \"^package|sdkVersion|targetSdkVersion|native-code\" || true\n  sha256sum \"$APK\"\ndone"
         },
         {
           "name": "Buat rilis",
@@ -58,7 +52,8 @@
           "with": {
             "tag_name": "build-${{ github.run_number }}",
             "name": "Hardsub OCR build ${{ github.run_number }}",
-            "files": "build/app/outputs/flutter-apk/app-release.apk"
+            "body": "Pasang dulu app-arm64-v8a-release.apk. Jika gagal, coba app-armeabi-v7a-release.apk.",
+            "files": "build/app/outputs/flutter-apk/app-arm64-v8a-release.apk\nbuild/app/outputs/flutter-apk/app-armeabi-v7a-release.apk"
           }
         }
       ]
