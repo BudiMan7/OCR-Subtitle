@@ -388,7 +388,7 @@ String buildAss(List<Sub> subs, int vw, int vh, {int fontSize = 48}) {
     ..writeln('ScriptType: v4.00+')
     ..writeln('PlayResX: $vw')
     ..writeln('PlayResY: $vh')
-    ..writeln('WrapStyle: 0') // 0 = smart wrap (player ikut bungkus kalau perlu)
+    ..writeln('WrapStyle: 0')
     ..writeln('ScaledBorderAndShadow: yes')
     ..writeln()
     ..writeln('[V4+ Styles]')
@@ -397,16 +397,15 @@ String buildAss(List<Sub> subs, int vw, int vh, {int fontSize = 48}) {
         'ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, '
         'Alignment, MarginL, MarginR, MarginV, Encoding');
 
-  // Style Dialog: bawah-tengah (an2)
   b.writeln('Style: Dialog,Arial,$fontSize,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,'
       '0,0,0,0,100,100,0,0,1,2,1,2,$marginL,$marginR,$marginVBottom,1');
-  // Style Label: bawah-tengah tapi lebih naik
   b.writeln('Style: Label,Arial,$fontSize,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,'
       '0,0,0,0,100,100,0,0,1,2,1,2,$marginL,$marginR,${marginVBottom + (fontSize * maxLinesPerZone * 1.2).round()},1');
-  // Style Top: atas-tengah (an8)
   b.writeln('Style: Top,Arial,$fontSize,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,'
       '0,0,0,0,100,100,0,0,1,2,1,8,$marginL,$marginR,$marginVTop,1');
-  b.writeln()
+
+  b
+    ..writeln()
     ..writeln('[Events]')
     ..writeln('Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text');
 
