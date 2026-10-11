@@ -1,5 +1,5 @@
 name: hardsub_ocr
-description: Hardsub OCR ke SRT (hanya huruf Latin)
+description: Hardsub OCR ke SRT/ASS
 publish_to: 'none'
 version: 1.0.0+1
 
@@ -11,7 +11,9 @@ dependencies:
     sdk: flutter
   google_mlkit_text_recognition: '>=0.13.0 <1.0.0'
 
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
 flutter:
   uses-material-design: true
-  assets:
-    - assets/kamus_id.txt
