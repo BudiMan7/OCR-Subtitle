@@ -163,6 +163,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   bool testMode = true;
   int quality = 1; // 0 cepat, 1 seimbang, 2 teliti (baca 2x)
   int refTimeline = 0; // 0 ikuti waktu referensi, 1 tetap garis waktu video
+  double assPct = 0; // ukuran huruf ASS, % tinggi video (0 = otomatis)
 
   // ---- referensi ----
   List<Cue> refCues = [];
@@ -268,6 +269,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     quality = (j['quality'] is int) ? (j['quality'] as int).clamp(0, 2).toInt() : quality;
     refTimeline = (j['refTimeline'] is int) ? (j['refTimeline'] as int).clamp(0, 1).toInt() : refTimeline;
     bright = _d(j['bright'], bright).clamp(120.0, 245.0).toDouble();
+    assPct = _d(j['assPct'], 0.0).clamp(0.0, 9.0).toDouble();
     final iv = _d(j['interval'], interval);
     interval = (iv == 0.33 || iv == 0.5 || iv == 1.0) ? iv : 0.33;
     lastUri = j['lastUri'] as String?;
@@ -287,6 +289,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         'testMode': testMode,
         'quality': quality,
         'refTimeline': refTimeline,
+        'assPct': assPct,
         'lastUri': lastUri,
         'lastName': lastName,
       }));
@@ -373,9 +376,9 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     try {
       final r = await _ch.invokeMapMethod<String, dynamic>('pickText');
       if (r == null) return;
-      final cues = parseSrtFile(r['text'] as String);
+      final cues = parseReference(r['text'] as String);
       if (cues.isEmpty) {
-        _snack('File ini tidak berisi subtitle SRT yang bisa dibaca.');
+        _snack('File ini tidak berisi dialog SRT/ASS yang bisa dibaca.');
         return;
       }
       setState(() {
@@ -497,7 +500,15 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     final out = <_Ln>[];
     for (final l in lines) {
       final t = cleanText(l.text, mode);
-      if (t.isNotEmpty) out.add(_Ln(t, l.box, l.src));
+      if (t.isEmpty) continue;
+      // buang alamat web/watermark (mis. rajanime.com) dari baris
+      final st = stripDomains(t);
+      if (st.text.isEmpty || letterCount(st.text) < 1) continue;
+      var box = l.box;
+      if (st.text != t) {
+        box = Rect.fromLTRB(l.box.left + l.box.width * st.cutL, l.box.top, l.box.right - l.box.width * st.cutR, l.box.bottom);
+      }
+      out.add(_Ln(st.text, box, l.src));
     }
     return out;
   }
@@ -887,7 +898,8 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   List<Sub> _analyze(List<OcrStep> list, double iv, List<OcrArea> act) {
     final all = <Sub>[];
     for (final a in act) {
-      final samples = list.map((s) => Sample(s.t, s.c[a.id] ?? <Cand>[])).toList();
+      final samples = list.map((s) => Sample(s.t, (s.c[a.id] ?? <Cand>[]).map((c) => c.copy()).toList())).toList();
+      stripOverlays(samples); // watermark yang menempel di ujung baris pada banyak kalimat
       all.addAll(tracksToSubs(buildTracks(samples, iv), iv, area: a.id));
     }
     all.sort((a, b) => a.start.compareTo(b.start));
@@ -956,7 +968,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     final jaOnly = act.isNotEmpty && act.every((a) => a.script == 1);
     final fileName = '${_baseName()}${testMode ? '.TEST' : ''}${jaOnly ? '.ja' : ''}${ass ? '.ass' : '.srt'}';
     final text = ass
-        ? buildAss(subs, width: vw, height: vh, areaNames: {for (final a in areas) a.id: a.name}, includeDoubtful: includeDoubtful)
+        ? buildAss(subs, width: vw, height: vh, includeDoubtful: includeDoubtful, fontPx: assPct > 0 ? assPct / 100 * (vh > 0 ? vh : 720) : null)
         : buildSrt(subs, includeDoubtful: includeDoubtful);
     try {
       final where = await _ch.invokeMethod<String>('save', {'name': fileName, 'text': text, 'mime': ass ? 'text/x-ssa' : 'application/x-subrip'});
@@ -966,7 +978,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         builder: (c) => AlertDialog(
           title: Text(ass ? 'ASS tersimpan' : 'SRT tersimpan'),
           content: Text('$where ($n subtitle)\n\nDi MX Player: menu subtitle → Buka → pilih file ini dari folder Download.'
-              '${ass ? '\n\nASS menyimpan posisi atas/bawah. Dukungan posisi tergantung pemutar; jika posisi tidak terlihat, pakai SRT.' : '\n\nSRT tidak menyimpan posisi (atas/bawah). Dua subtitle yang tampil bersamaan menjadi dua entri.'}'
+              '${ass ? '\n\nASS memakai ukuran huruf tetap dan posisi tetap per lajur (atas / tengah / bawah). Jika pemutar mengabaikan ASS, pakai SRT.' : '\n\nSRT tidak menyimpan posisi (atas/bawah). Dua subtitle yang tampil bersamaan menjadi dua entri.'}'
               '${testMode ? '\n\nIni hasil UJI. Matikan "Mode uji" di tab Siapkan untuk memproses seluruh video.' : ''}'),
           actions: [TextButton(onPressed: () => Navigator.pop(c), child: const Text('OK'))],
         ),
@@ -1534,7 +1546,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         OutlinedButton.icon(
           onPressed: running ? null : pickRef,
           icon: const Icon(Icons.upload_file),
-          label: Text(refCues.isEmpty ? 'Pilih file .srt Inggris' : 'Ganti file referensi'),
+          label: Text(refCues.isEmpty ? 'Pilih file .srt atau .ass Inggris' : 'Ganti file referensi'),
         ),
         if (refCues.isNotEmpty)
           Padding(
@@ -1798,6 +1810,25 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
           value: includeDoubtful,
           onChanged: (v) => setState(() => includeDoubtful = v),
         ),
+      ),
+      Padding(
+        padding: const EdgeInsets.fromLTRB(12, 0, 12, 4),
+        child: Row(children: [
+          const Text('Ukuran huruf ASS: '),
+          DropdownButton<double>(
+            value: const [0.0, 4.0, 4.5, 5.0, 5.5, 6.0, 7.0].contains(assPct) ? assPct : 0.0,
+            items: const [
+              DropdownMenuItem(value: 0.0, child: Text('Otomatis')),
+              DropdownMenuItem(value: 4.0, child: Text('Kecil (4%)')),
+              DropdownMenuItem(value: 4.5, child: Text('4,5%')),
+              DropdownMenuItem(value: 5.0, child: Text('Sedang (5%)')),
+              DropdownMenuItem(value: 5.5, child: Text('5,5%')),
+              DropdownMenuItem(value: 6.0, child: Text('Besar (6%)')),
+              DropdownMenuItem(value: 7.0, child: Text('Sangat besar (7%)')),
+            ],
+            onChanged: (v) => _set(() => assPct = v ?? 0.0),
+          ),
+        ]),
       ),
       Padding(
         padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
