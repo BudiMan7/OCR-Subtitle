@@ -3,6 +3,10 @@
 set -eu
 mkdir -p lib
 cp main.dart lib/main.dart
+cp algo.dart lib/algo.dart
+mkdir -p test
+rm -f test/widget_test.dart
+cp algo_test.dart test/algo_test.dart
 
 if [ -f android/app/build.gradle.kts ]; then
   GRADLE=android/app/build.gradle.kts
