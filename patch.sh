@@ -4,6 +4,8 @@ set -eu
 mkdir -p lib
 cp main.dart lib/main.dart
 
+# ... sisa patch.sh (minSdk, R8, MainActivity, manifest, dst.)
+
 
 if [ -d assets ]; then
   mkdir -p assets
