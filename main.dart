@@ -236,7 +236,7 @@ double evaluateCandidate(String text, int letterCountVal) {
   double score = 1.0;
   if (letterCountVal < 2) score -= 0.5;
   if (text.length > 120) score -= 0.2;
-  if (RegExp(r'^[A-Z0-9]{1,4}$').hasMatch(text)) score -= 0.4; // Filter kode acak / logo pendek
+  if (RegExp(r'^[A-Z0-9]{1,4}$').hasMatch(text)) score -= 0.4;
   return score.clamp(0.0, 1.0);
 }
 
@@ -565,7 +565,6 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     try {
       final u = await _ch.invokeMethod<String>('pick');
       if (u == null) return;
-      // Membaca file referensi SRT
       final file = File(u.replaceAll('file://', ''));
       if (await file.exists()) {
         final content = await file.readAsString();
@@ -771,7 +770,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
           if (testResult.isNotEmpty) Padding(padding: const EdgeInsets.only(top: 8), child: Text(testResult)),
         ]),
         FilledButton.icon(onPressed: () => _tabs.animateTo(1), icon: const Icon(Icons.arrow_forward), label: const Text('Lanjut ke Proses')),
-      ]),
+      ],
     ]);
   }
 
