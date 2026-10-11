@@ -7,17 +7,23 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 
-// ======================= PENGATURAN OCR =======================
-const double kChangeFrac = 0.0015; // frame dianggap sama jika perubahan piksel di bawah ini
+// =====================================================================
+//  HARDSUB OCR → SRT
+//  Alur: pilih video → atur area/jenis tulisan → OCR (di HP, offline)
+//        → koreksi → ekspor .srt ke folder Download.
+// =====================================================================
+
+// ----------------------- konstanta OCR -----------------------
+const double kChangeFrac = 0.0015; // perubahan piksel teks di bawah ini = frame dianggap sama
 const double kMinTextFrac = 0.001; // minimal piksel teks agar dianggap ada subtitle
-const double kSim = 0.85; // kemiripan teks agar digabung
-const double kMaxDropoutSec = 0.6;
+const double kSim = 0.85; // kemiripan teks agar digabung jadi satu subtitle
+const double kMaxDropoutSec = 0.6; // OCR gagal sesaat di tengah subtitle masih dianggap sama
 const double kMinDuration = 0.7;
 const int kSaveEvery = 100;
 
 const MethodChannel _ch = MethodChannel('hardsub/native');
 
-// ======================= UTILITAS =======================
+// ----------------------- util waktu -----------------------
 String fmtSrt(double t) {
   var ms = (math.max(0.0, t) * 1000).round();
   final h = ms ~/ 3600000;
@@ -40,29 +46,62 @@ double parseSrt(String s) {
   return h * 3600 + mi * 60 + se + ms / 1000;
 }
 
-int letterCount(String t) => RegExp(r'[A-Za-zÀ-ɏ]').allMatches(t).length;
+/// 125 detik -> "02:05" ; 3725 detik -> "1:02:05"
+String fmtClock(double t) {
+  final s = t.round();
+  final h = s ~/ 3600;
+  final m = (s % 3600) ~/ 60;
+  final sec = s % 60;
+  String p(int v) => v.toString().padLeft(2, '0');
+  return h > 0 ? '$h:${p(m)}:${p(sec)}' : '${p(m)}:${p(sec)}';
+}
 
-String norm(String t) => t.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]+'), '');
+/// "08:00" (menit:detik) atau "1:08:00" (jam:menit:detik) -> detik. null jika salah format.
+double? parseClock(String s) {
+  final m = RegExp(r'^\s*(?:(\d+):)?(\d{1,3}):(\d{1,2})\s*$').firstMatch(s);
+  if (m == null) return null;
+  final h = int.parse(m.group(1) ?? '0');
+  final mi = int.parse(m.group(2)!);
+  final se = int.parse(m.group(3)!);
+  if (se >= 60) return null;
+  return (h * 3600 + mi * 60 + se).toDouble();
+}
 
-final RegExp _cjk = RegExp(r'[　-ヿ㐀-䶿一-鿿豈-﫿＀-￯가-힯]');
+String fmtDur(int sec) => sec >= 60 ? '${sec ~/ 60} mnt ${sec % 60} dtk' : '$sec dtk';
 
-/// Bersihkan hasil OCR: buang huruf non-Latin & baris sampah.
-String cleanText(String t) {
+// ----------------------- util teks -----------------------
+const String _latinExt = r'\u00C0-\u024F';
+const String _cjkCore = r'\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff';
+final RegExp _reLetter = RegExp('[A-Za-z$_latinExt$_cjkCore]');
+final RegExp _reNormDrop = RegExp('[^a-z0-9$_cjkCore]+');
+final RegExp _reAlnum = RegExp('[A-Za-z0-9$_latinExt$_cjkCore]');
+final RegExp _cjk = RegExp(r'[\u3000-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\uffef\uac00-\ud7af]');
+
+int letterCount(String t) => _reLetter.allMatches(t).length;
+String norm(String t) => t.toLowerCase().replaceAll(_reNormDrop, '');
+bool hasCjk(String t) => _cjk.hasMatch(t);
+
+/// Bersihkan hasil OCR. mode: 0 = Latin saja, 1 = Jepang saja, 2 = keduanya.
+String cleanText(String t, int mode) {
   final out = <String>[];
   for (var line in t.split('\n')) {
     final nCjk = _cjk.allMatches(line).length;
-    if (nCjk > 0) {
-      final latin = RegExp(r'[A-Za-z]').allMatches(line).length;
-      if (latin >= 3 * nCjk && latin >= 3) {
-        line = line.replaceAll(_cjk, ' ');
-      } else {
-        continue;
+    if (mode == 0) {
+      if (nCjk > 0) {
+        final latin = RegExp(r'[A-Za-z]').allMatches(line).length;
+        if (latin >= 3 * nCjk && latin >= 3) {
+          line = line.replaceAll(_cjk, ' '); // dominan Latin: buang huruf asingnya saja
+        } else {
+          continue; // dominan Jepang: buang seluruh baris
+        }
       }
+    } else if (mode == 1) {
+      if (nCjk == 0) continue; // Jepang saja: buang baris tanpa huruf Jepang
     }
     line = line.replaceAll(RegExp(r'\s+'), ' ').trim();
     final compact = line.replaceAll(' ', '');
     if (compact.isEmpty) continue;
-    final alnum = RegExp(r'[A-Za-z0-9À-ɏ]').allMatches(compact).length;
+    final alnum = _reAlnum.allMatches(compact).length;
     if (alnum >= 1 && alnum / compact.length >= 0.6) out.add(line);
   }
   return out.join('\n');
@@ -93,11 +132,12 @@ double simRatio(String a, String b) {
 
 bool similar(String a, String b) {
   if (a == b) return true;
-  if (math.min(a.length, b.length) < 6) return false; // teks pendek harus identik
+  final minLen = (hasCjk(a) || hasCjk(b)) ? 3 : 6;
+  if (math.min(a.length, b.length) < minLen) return false; // teks pendek harus identik
   return simRatio(a, b) >= kSim;
 }
 
-// ======================= MODEL =======================
+// ----------------------- model -----------------------
 class Sample {
   double t;
   String text;
@@ -146,7 +186,13 @@ class _R {
   _R(this.first, this.last, this.count, this.n, this.text);
 }
 
-/// Gabungkan sampel OCR menjadi subtitle (port dari versi Colab).
+class _Ln {
+  final String text;
+  final Rect box;
+  _Ln(this.text, this.box);
+}
+
+// ----------------------- penggabungan sampel -> subtitle -----------------------
 List<Sub> mergeSamples(List<Sample> samples, double interval) {
   const eps = 1e-6;
   final groups = <_G>[];
@@ -157,7 +203,8 @@ List<Sub> mergeSamples(List<Sample> samples, double interval) {
     final c = cur;
     if (c != null) {
       final gap = s.t - c.last;
-      final gapOk = gap <= interval + eps || (gap <= interval + kMaxDropoutSec + eps && n.length >= 6);
+      final longEnough = n.length >= (hasCjk(n) ? 3 : 6);
+      final gapOk = gap <= interval + eps || (gap <= interval + kMaxDropoutSec + eps && longEnough);
       if (gapOk && similar(n, c.lastN)) {
         c.add(s.t, s.text, n);
         continue;
@@ -190,7 +237,7 @@ List<Sub> mergeSamples(List<Sample> samples, double interval) {
     recs.add(_R(g.first, g.last, g.ns.length, bestN, bestT));
   }
 
-  // Sampel tunggal yang mirip tetangga = salah baca sesaat -> gabungkan ke tetangga
+  // Sampel tunggal yang mirip tetangganya = salah baca sesaat -> gabungkan ke tetangga
   final absorbed = <int>{};
   for (var i = 0; i < recs.length; i++) {
     final r = recs[i];
@@ -255,7 +302,52 @@ String buildSrt(List<Sub> subs) {
   return b.toString();
 }
 
-// ======================= APLIKASI =======================
+// ----------------------- koreksi otomatis (kamus dari hasil sendiri) -----------------------
+final RegExp _wordRe = RegExp(r'[A-Za-z0-9]+');
+
+String _canon(String w) {
+  var s = w.toLowerCase().replaceAll('rn', 'm').replaceAll('vv', 'w');
+  s = s.replaceAll(RegExp(r'[l1]'), 'i').replaceAll('0', 'o');
+  return s;
+}
+
+String _matchCase(String orig, String fixed) {
+  if (orig.length > 1 && orig == orig.toUpperCase()) return fixed.toUpperCase();
+  if (orig.isNotEmpty && orig[0] == orig[0].toUpperCase() && orig[0] != orig[0].toLowerCase()) {
+    return fixed[0].toUpperCase() + fixed.substring(1);
+  }
+  return fixed;
+}
+
+/// Kata langka yang hanya beda huruf mirip (l/I/1, 0/O, rn/m) dari kata yang sering muncul.
+Map<String, String> buildFixes(List<Sub> subs) {
+  final freq = <String, int>{};
+  for (final s in subs) {
+    for (final m in _wordRe.allMatches(s.text)) {
+      final w = m.group(0)!.toLowerCase();
+      freq[w] = (freq[w] ?? 0) + 1;
+    }
+  }
+  final best = <String, String>{};
+  for (final e in freq.entries) {
+    if (e.value >= 3 && e.key.length >= 3) {
+      final c = _canon(e.key);
+      final cur = best[c];
+      if (cur == null || (freq[cur] ?? 0) < e.value) best[c] = e.key;
+    }
+  }
+  final fixes = <String, String>{};
+  for (final e in freq.entries) {
+    if (e.key.length < 3 || e.value > 2) continue;
+    final b = best[_canon(e.key)];
+    if (b != null && b != e.key && (freq[b] ?? 0) >= e.value * 3) fixes[e.key] = b;
+  }
+  return fixes;
+}
+
+// =====================================================================
+//  APLIKASI
+// =====================================================================
 void main() => runApp(const HardsubApp());
 
 class HardsubApp extends StatelessWidget {
@@ -264,7 +356,9 @@ class HardsubApp extends StatelessWidget {
   Widget build(BuildContext context) => MaterialApp(
         title: 'Hardsub OCR',
         debugShowCheckedModeBanner: false,
+        themeMode: ThemeMode.system,
         theme: ThemeData(colorSchemeSeed: Colors.indigo, useMaterial3: true),
+        darkTheme: ThemeData(colorSchemeSeed: Colors.indigo, brightness: Brightness.dark, useMaterial3: true),
         home: const Home(),
       );
 }
@@ -278,37 +372,50 @@ class Home extends StatefulWidget {
 class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   late final TabController _tabs = TabController(length: 3, vsync: this);
   final TextRecognizer _rec = TextRecognizer(script: TextRecognitionScript.latin);
+  TextRecognizer? _recJp;
+  TextRecognizer get _jp => _recJp ??= TextRecognizer(script: TextRecognitionScript.japanese);
+  final TextEditingController _timeCtl = TextEditingController(text: '00:30');
 
-  // video
+  // ---- video ----
   String? uri;
   String name = '';
   int durMs = 0;
   int vw = 0, vh = 0;
-  double previewT = 0;
+  double previewT = 30;
   Uint8List? previewBytes;
   double previewAspect = 16 / 9;
+  String? lastUri;
+  String lastName = '';
 
-  // area & pengaturan
-  RangeValues yR = const RangeValues(0.74, 0.97);
+  // ---- pengaturan (disimpan otomatis) ----
+  RangeValues yR = const RangeValues(0.72, 0.92);
   RangeValues xR = const RangeValues(0.05, 0.95);
-  double interval = 0.5;
-  bool testMode = true;
+  int script = 0; // 0 Latin, 1 Jepang, 2 keduanya
+  bool autoPos = false; // posisi subtitle berpindah-pindah: baca seluruh layar
+  bool strictLatin = true; // mode Latin: buang area yang dikenali sebagai tulisan Jepang
   bool light = true;
-  double bright = 200;
-  String testResult = '';
+  double bright = 210;
+  double interval = 0.33;
+  bool adaptive = true;
+  bool testMode = true;
 
-  // proses
+  // ---- proses ----
   bool running = false;
   bool cancel = false;
   double progress = 0;
   String status = 'Belum mulai.';
+  String testResult = '';
   List<Sample> samples = [];
 
-  // hasil
+  // ---- hasil ----
   List<Sub> subs = [];
   bool onlyWarn = false;
   String filesDir = '';
 
+  RangeValues get _effX => autoPos ? const RangeValues(0.02, 0.98) : xR;
+  RangeValues get _effY => autoPos ? const RangeValues(0.02, 0.98) : yR;
+
+  // ===================== siklus hidup =====================
   @override
   void initState() {
     super.initState();
@@ -318,19 +425,22 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   Future<void> _init() async {
     try {
       filesDir = await _ch.invokeMethod<String>('dirs') ?? '';
+      await _loadSettings();
       final f = File('$filesDir/subs.json');
       if (await f.exists()) {
         final j = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
         subs = (j['subs'] as List).map((e) => Sub.fromJson(e as Map<String, dynamic>)).toList();
-        name = (j['name'] as String?) ?? '';
-        if (mounted) setState(() {});
+        name = (j['name'] as String?) ?? name;
       }
     } catch (_) {}
+    if (mounted) setState(() {});
   }
 
   @override
   void dispose() {
     _rec.close();
+    _recJp?.close();
+    _timeCtl.dispose();
     _tabs.dispose();
     super.dispose();
   }
@@ -340,11 +450,68 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
   }
 
-  // ---------- video ----------
+  // ===================== pengaturan tersimpan =====================
+  double _d(dynamic v, double def) => v is num ? v.toDouble() : def;
+
+  Future<void> _loadSettings() async {
+    final f = File('$filesDir/settings.json');
+    if (!await f.exists()) return;
+    final j = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
+    yR = RangeValues(_d(j['y0'], yR.start), _d(j['y1'], yR.end));
+    xR = RangeValues(_d(j['x0'], xR.start), _d(j['x1'], xR.end));
+    script = (j['script'] is int) ? (j['script'] as int).clamp(0, 2).toInt() : script;
+    autoPos = j['autoPos'] is bool ? j['autoPos'] as bool : autoPos;
+    strictLatin = j['strictLatin'] is bool ? j['strictLatin'] as bool : strictLatin;
+    light = j['light'] is bool ? j['light'] as bool : light;
+    adaptive = j['adaptive'] is bool ? j['adaptive'] as bool : adaptive;
+    testMode = j['testMode'] is bool ? j['testMode'] as bool : testMode;
+    bright = _d(j['bright'], bright).clamp(120.0, 245.0).toDouble();
+    final iv = _d(j['interval'], interval);
+    interval = (iv == 0.33 || iv == 0.5 || iv == 1.0) ? iv : 0.33;
+    lastUri = j['lastUri'] as String?;
+    lastName = (j['lastName'] as String?) ?? '';
+  }
+
+  Future<void> _persist() async {
+    if (filesDir.isEmpty) return;
+    try {
+      await File('$filesDir/settings.json').writeAsString(jsonEncode({
+        'y0': yR.start,
+        'y1': yR.end,
+        'x0': xR.start,
+        'x1': xR.end,
+        'script': script,
+        'autoPos': autoPos,
+        'strictLatin': strictLatin,
+        'light': light,
+        'bright': bright,
+        'interval': interval,
+        'adaptive': adaptive,
+        'testMode': testMode,
+        'lastUri': lastUri,
+        'lastName': lastName,
+      }));
+    } catch (_) {}
+  }
+
+  void _set(VoidCallback f) {
+    setState(f);
+    _persist();
+  }
+
+  // ===================== video =====================
   Future<void> pickVideo() async {
     try {
       final u = await _ch.invokeMethod<String>('pick');
       if (u == null) return;
+      await _openUri(u);
+    } catch (e) {
+      _snack('Gagal: $e');
+    }
+  }
+
+  Future<void> _openUri(String u) async {
+    try {
       setState(() => status = 'Membuka video...');
       final info = await _ch.invokeMapMethod<String, dynamic>('open', {'uri': u});
       if (info == null) throw Exception('Gagal membuka video');
@@ -355,12 +522,17 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         vw = (info['width'] as num).toInt();
         vh = (info['height'] as num).toInt();
         previewT = math.min(30.0, durMs / 2000.0);
+        _timeCtl.text = fmtClock(previewT);
         samples = [];
+        lastUri = u;
+        lastName = name;
         status = 'Video siap.';
       });
+      _persist();
       await loadPreview();
     } catch (e) {
-      _snack('Gagal: $e');
+      setState(() => status = 'Belum mulai.');
+      _snack('Tidak bisa membuka video: $e');
     }
   }
 
@@ -378,26 +550,87 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     }
   }
 
-  // ---------- OCR ----------
-  Future<String> _ocrFile(String path) async {
-    final r = await _rec.processImage(InputImage.fromFilePath(path));
-    final lines = <String>[];
-    for (final b in r.blocks) {
-      for (final l in b.lines) {
-        lines.add(l.text);
-      }
+  Future<void> applyTime() async {
+    final t = parseClock(_timeCtl.text);
+    if (t == null) {
+      _snack('Format waktu salah. Contoh: 08:00 (menit:detik)');
+      return;
     }
-    return cleanText(lines.join('\n'));
+    final maxT = math.max(0.0, durMs / 1000.0 - 1);
+    setState(() => previewT = t.clamp(0.0, maxT).toDouble());
+    _timeCtl.text = fmtClock(previewT);
+    await loadPreview();
   }
 
-  Future<String> _ocrBest(String rawPath) async {
-    var best = await _ocrFile(rawPath);
+  Future<void> nudge(double delta) async {
+    final maxT = math.max(0.0, durMs / 1000.0 - 1);
+    setState(() => previewT = (previewT + delta).clamp(0.0, maxT).toDouble());
+    _timeCtl.text = fmtClock(previewT);
+    await loadPreview();
+  }
+
+  // ===================== OCR =====================
+  double _overlap(Rect a, Rect b) {
+    if (!a.overlaps(b)) return 0;
+    final i = a.intersect(b);
+    final area = a.width * a.height;
+    return area <= 0 ? 0 : (i.width * i.height) / area;
+  }
+
+  Future<String> _ocrFile(String path, double imgH) async {
+    final input = InputImage.fromFilePath(path);
+    final lines = <_Ln>[];
+    if (script == 0) {
+      final r = await _rec.processImage(input);
+      for (final b in r.blocks) {
+        for (final l in b.lines) {
+          lines.add(_Ln(l.text, l.boundingBox));
+        }
+      }
+      if (strictLatin && lines.isNotEmpty) {
+        // Pengenal Jepang dipakai hanya untuk menandai area tulisan Jepang, lalu area itu dibuang
+        final rj = await _jp.processImage(input);
+        final jpBoxes = <Rect>[];
+        for (final b in rj.blocks) {
+          for (final l in b.lines) {
+            if (hasCjk(l.text)) jpBoxes.add(l.boundingBox);
+          }
+        }
+        if (jpBoxes.isNotEmpty) {
+          lines.removeWhere((ln) => jpBoxes.any((jb) => _overlap(ln.box, jb) > 0.3));
+        }
+      }
+    } else {
+      final r = await _jp.processImage(input);
+      for (final b in r.blocks) {
+        for (final l in b.lines) {
+          lines.add(_Ln(l.text, l.boundingBox));
+        }
+      }
+    }
+    final kept = <_Ln>[];
+    for (final ln in lines) {
+      if (autoPos) {
+        // seluruh layar: hanya baris berukuran wajar untuk subtitle
+        final ratio = ln.box.height / imgH;
+        if (ratio < 0.025 || ratio > 0.12) continue;
+        if (letterCount(ln.text) < 3) continue;
+      }
+      kept.add(ln);
+    }
+    kept.sort((a, b) => a.box.top.compareTo(b.box.top));
+    return cleanText(kept.map((l) => l.text).join('\n'), script);
+  }
+
+  Future<String> _ocrBest(String rawPath, int cw, int ch) async {
+    var best = await _ocrFile(rawPath, ch.toDouble());
     final lt = letterCount(best);
     if (lt >= 6) return best;
     // coba versi hitam-putih (hanya piksel teks)
     final binPath = await _ch.invokeMethod<String>('binarize');
     if (binPath != null) {
-      final alt = await _ocrFile(binPath);
+      final binH = ch * (cw > 900 ? 1 : 2) + 20;
+      final alt = await _ocrFile(binPath, binH.toDouble());
       if (letterCount(alt) > lt) best = alt;
     }
     return best;
@@ -405,13 +638,13 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
 
   Map<String, dynamic> _grabArgs(int tMs, {bool force = false}) => {
         'timeMs': tMs,
-        'x0': xR.start,
-        'x1': xR.end,
-        'y0': yR.start,
-        'y1': yR.end,
+        'x0': _effX.start,
+        'x1': _effX.end,
+        'y0': _effY.start,
+        'y1': _effY.end,
         'light': light,
         'bright': bright.round(),
-        'minFrac': kMinTextFrac,
+        'minFrac': autoPos ? kMinTextFrac * 0.3 : kMinTextFrac,
         'changeFrac': kChangeFrac,
         'force': force,
       };
@@ -424,16 +657,31 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       if (g == null || g['ok'] != true) throw Exception('frame tidak terbaca');
       final path = g['path'] as String?;
       final frac = (g['frac'] as num).toDouble();
-      var txt = path == null ? '' : await _ocrBest(path);
-      setState(() => testResult = (frac < kMinTextFrac ? '(Tidak ada teks terang di area ini. Cek waktu/area/ambang.)\n' : '') +
-          (txt.isEmpty ? '(kosong)' : txt));
+      final txt = path == null ? '' : await _ocrBest(path, (g['cw'] as num).toInt(), (g['ch'] as num).toInt());
+      final warn = frac < (autoPos ? kMinTextFrac * 0.3 : kMinTextFrac)
+          ? '(Teks terang tidak terdeteksi. Cek waktu, area, atau turunkan ambang kecerahan.)\n'
+          : '';
+      setState(() => testResult = warn + (txt.isEmpty ? '(kosong)' : txt));
     } catch (e) {
       setState(() => testResult = 'Error: $e');
     }
   }
 
   String _sig(int s, int e, int step) =>
-      '$uri|$s|$e|$step|${xR.start.toStringAsFixed(2)},${xR.end.toStringAsFixed(2)},${yR.start.toStringAsFixed(2)},${yR.end.toStringAsFixed(2)}|$light|${bright.round()}';
+      '$uri|$s|$e|$step|${_effX.start.toStringAsFixed(2)},${_effX.end.toStringAsFixed(2)},'
+      '${_effY.start.toStringAsFixed(2)},${_effY.end.toStringAsFixed(2)}|$light|${bright.round()}|$adaptive|$script|$autoPos|$strictLatin';
+
+  Future<void> clearTemp() async {
+    try {
+      final f = File('$filesDir/ocr_raw.json');
+      if (await f.exists()) await f.delete();
+    } catch (_) {}
+    setState(() {
+      samples = [];
+      progress = 0;
+      status = 'Hasil sementara dihapus.';
+    });
+  }
 
   Future<void> runOcr() async {
     if (uri == null || running) return;
@@ -465,55 +713,95 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       } catch (_) {}
     }
 
+    final resumedFrom = list.length;
     setState(() {
       running = true;
       cancel = false;
       samples = list;
+      progress = list.length / total;
       status = list.isEmpty ? 'Memulai...' : 'Melanjutkan dari ${list.length}/$total';
     });
-    await _ch.invokeMethod('keepAwake', {'on': true});
+    _persist();
+    try {
+      await _ch.invokeMethod('serviceStart', {'text': 'OCR dimulai...'});
+    } catch (_) {}
     await _ch.invokeMethod('resetPrev');
     final t0 = DateTime.now();
-    var prevText = list.isEmpty ? '' : list.last.text;
+    var lastGrabText = list.isEmpty ? '' : list.last.text;
     var failStreak = 0;
     var frameFails = 0;
-    try {
-      for (var i = list.length; i < total; i++) {
-        if (cancel) break;
-        final tMs = startMs + i * step;
-        var text = '';
-        try {
-          final g = await _ch.invokeMapMethod<String, dynamic>('grab', _grabArgs(tMs));
-          if (g == null || g['ok'] != true) {
-            frameFails++;
+
+    Future<String> sampleAt(int n) async {
+      final tMs = startMs + n * step;
+      var text = '';
+      try {
+        final g = await _ch.invokeMapMethod<String, dynamic>('grab', _grabArgs(tMs));
+        if (g == null || g['ok'] != true) {
+          frameFails++;
+        } else {
+          final frac = (g['frac'] as num).toDouble();
+          final changed = (g['changed'] as num).toDouble();
+          final path = g['path'] as String?;
+          if (frac < (autoPos ? kMinTextFrac * 0.3 : kMinTextFrac)) {
             text = '';
-          } else {
-            final frac = (g['frac'] as num).toDouble();
-            final changed = (g['changed'] as num).toDouble();
-            final path = g['path'] as String?;
-            if (frac < kMinTextFrac) {
-              text = '';
-            } else if (changed >= 0 && changed < kChangeFrac) {
-              text = prevText;
-            } else if (path != null) {
-              text = await _ocrBest(path);
-            }
+          } else if (changed >= 0 && changed < kChangeFrac) {
+            text = lastGrabText;
+          } else if (path != null) {
+            text = await _ocrBest(path, (g['cw'] as num).toInt(), (g['ch'] as num).toInt());
           }
-          failStreak = 0;
-        } catch (e) {
-          failStreak++;
-          if (failStreak >= 20) throw Exception('Terlalu banyak kegagalan beruntun: $e');
         }
-        prevText = text;
-        list.add(Sample(tMs / 1000.0, text));
-        if (list.length % kSaveEvery == 0) await checkpoint();
-        if (list.length % 5 == 0 || i == total - 1) {
+        failStreak = 0;
+      } catch (e) {
+        failStreak++;
+        if (failStreak >= 20) throw Exception('Terlalu banyak kegagalan beruntun: $e');
+      }
+      lastGrabText = text;
+      return text;
+    }
+
+    bool sameText(String a, String b) {
+      if (a.isEmpty || b.isEmpty) return a.isEmpty && b.isEmpty;
+      final na = norm(a);
+      final nb = norm(b);
+      return na == nb || similar(na, nb);
+    }
+
+    void push(int n, String text) => list.add(Sample((startMs + n * step) / 1000.0, text));
+
+    try {
+      var sinceSave = 0;
+      var iter = 0;
+      while (list.length < total) {
+        if (cancel) break;
+        final n = list.length;
+        if (adaptive && n >= 1 && n + 1 < total) {
+          // Mode cepat: periksa tiap 2 langkah; sampel tengah hanya diperiksa jika kiri & kanan berbeda
+          final a = list[n - 1].text;
+          final c = await sampleAt(n + 1);
+          final b = sameText(a, c) ? a : await sampleAt(n);
+          push(n, b);
+          push(n + 1, c);
+          sinceSave += 2;
+        } else {
+          push(n, await sampleAt(n));
+          sinceSave += 1;
+        }
+        if (sinceSave >= kSaveEvery) {
+          await checkpoint();
+          sinceSave = 0;
+        }
+        if (iter++ % 3 == 0) {
           final el = DateTime.now().difference(t0).inSeconds;
           final done = list.length;
+          final doneNow = done - resumedFrom;
+          final eta = (doneNow > 10 && el > 0) ? fmtDur(((total - done) * el / doneNow).round()) : 'menghitung...';
           setState(() {
             progress = done / total;
-            status = 'OCR $done/$total  •  ${el}s berlalu';
+            status = 'OCR $done/$total  •  berjalan ${fmtDur(el)}  •  sisa ±$eta';
           });
+          try {
+            await _ch.invokeMethod('serviceUpdate', {'text': 'OCR $done/$total  •  sisa ±$eta', 'cur': done, 'max': total});
+          } catch (_) {}
         }
       }
       await checkpoint();
@@ -522,24 +810,32 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       setState(() {
         samples = list;
         subs = merged;
+        progress = list.length / total;
         status = cancel
-            ? 'Dihentikan. Tekan Mulai lagi untuk melanjutkan.'
+            ? 'Dihentikan di ${list.length}/$total. Tekan Mulai untuk melanjutkan.'
             : 'Selesai: ${list.length} sampel, $nonEmpty berisi teks, ${merged.length} subtitle.' +
                 (frameFails > 0 ? ' ($frameFails frame gagal dibaca)' : '') +
-                (nonEmpty == 0 ? ' PERINGATAN: tidak ada teks terbaca — cek area/ambang.' : '');
+                (nonEmpty == 0 ? ' PERINGATAN: tidak ada teks terbaca. Cek area, jenis tulisan, dan ambang kecerahan.' : '');
       });
       await saveSubs();
-      if (!cancel && merged.isNotEmpty) _tabs.animateTo(2);
+      if (!cancel) {
+        try {
+          await _ch.invokeMethod('notifyDone', {'text': 'Selesai: ${merged.length} subtitle. Ketuk untuk melihat hasil.'});
+        } catch (_) {}
+        if (merged.isNotEmpty) _tabs.animateTo(2);
+      }
     } catch (e) {
       await checkpoint();
-      setState(() => status = 'Berhenti karena error: $e (hasil sementara tersimpan)');
+      setState(() => status = 'Berhenti karena error: $e (hasil sementara tersimpan, tekan Mulai untuk melanjutkan)');
     } finally {
-      await _ch.invokeMethod('keepAwake', {'on': false});
+      try {
+        await _ch.invokeMethod('serviceStop');
+      } catch (_) {}
       if (mounted) setState(() => running = false);
     }
   }
 
-  // ---------- hasil ----------
+  // ===================== hasil =====================
   Future<void> saveSubs() async {
     try {
       await File('$filesDir/subs.json').writeAsString(jsonEncode({'name': name, 'subs': subs.map((s) => s.toJson()).toList()}));
@@ -554,7 +850,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     var base = name.isEmpty ? 'subtitle' : name;
     final dot = base.lastIndexOf('.');
     if (dot > 0) base = base.substring(0, dot);
-    final fileName = '$base${testMode ? '.TEST' : ''}.srt';
+    final fileName = '$base${testMode ? '.TEST' : ''}${script == 1 ? '.ja' : ''}.srt';
     try {
       final where = await _ch.invokeMethod<String>('save', {'name': fileName, 'text': buildSrt(subs)});
       if (!mounted) return;
@@ -562,13 +858,75 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         context: context,
         builder: (c) => AlertDialog(
           title: const Text('SRT tersimpan'),
-          content: Text('$where\n\nDi MX Player: menu subtitle → Buka → pilih file ini dari folder Download.'),
+          content: Text('$where\n\nDi MX Player: menu subtitle → Buka → pilih file ini dari folder Download.'
+              '${testMode ? '\n\nIni hasil UJI. Matikan "Mode uji" di tab Siapkan untuk memproses seluruh video.' : ''}'),
           actions: [TextButton(onPressed: () => Navigator.pop(c), child: const Text('OK'))],
         ),
       );
     } catch (e) {
       _snack('Gagal menyimpan: $e');
     }
+  }
+
+  Future<void> autoFix() async {
+    final fixes = buildFixes(subs);
+    if (fixes.isEmpty) {
+      _snack('Tidak ada koreksi yang cukup yakin.');
+      return;
+    }
+    final list = fixes.entries.map((e) => '${e.key} → ${e.value}').join('\n');
+    final yes = await showDialog<bool>(
+      context: context,
+      builder: (c) => AlertDialog(
+        title: Text('${fixes.length} koreksi ditemukan'),
+        content: SingleChildScrollView(child: Text(list)),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Batal')),
+          FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('Terapkan')),
+        ],
+      ),
+    );
+    if (yes != true) return;
+    for (final s in subs) {
+      s.text = s.text.replaceAllMapped(_wordRe, (m) {
+        final w = m.group(0)!;
+        final f = fixes[w.toLowerCase()];
+        return f == null ? w : _matchCase(w, f);
+      });
+    }
+    setState(() {});
+    await saveSubs();
+    _snack('Koreksi diterapkan.');
+  }
+
+  Future<void> findReplace() async {
+    final cari = TextEditingController();
+    final ganti = TextEditingController();
+    final yes = await showDialog<bool>(
+      context: context,
+      builder: (c) => AlertDialog(
+        title: const Text('Cari & ganti'),
+        content: Column(mainAxisSize: MainAxisSize.min, children: [
+          TextField(controller: cari, decoration: const InputDecoration(labelText: 'Cari')),
+          TextField(controller: ganti, decoration: const InputDecoration(labelText: 'Ganti dengan')),
+        ]),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Batal')),
+          FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('Ganti semua')),
+        ],
+      ),
+    );
+    if (yes != true || cari.text.isEmpty) return;
+    var n = 0;
+    for (final s in subs) {
+      if (s.text.contains(cari.text)) {
+        s.text = s.text.replaceAll(cari.text, ganti.text);
+        n++;
+      }
+    }
+    setState(() {});
+    await saveSubs();
+    _snack('$n subtitle diubah.');
   }
 
   Future<void> editSub(Sub s) async {
@@ -600,7 +958,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
             TextButton(
               onPressed: () async {
                 if (uri == null) {
-                  setD(() => err = 'Buka video dulu di tab 1 untuk melihat frame.');
+                  setD(() => err = 'Buka video dulu di tab Siapkan untuk melihat frame.');
                   return;
                 }
                 try {
@@ -677,87 +1035,194 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     );
   }
 
-  // ---------- UI ----------
+  // ===================== UI =====================
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Hardsub OCR → SRT'),
-        bottom: TabBar(controller: _tabs, tabs: const [Tab(text: '1 Video'), Tab(text: '2 Proses'), Tab(text: '3 Hasil')]),
+        title: const Text('Hardsub OCR'),
+        bottom: TabBar(controller: _tabs, tabs: const [
+          Tab(icon: Icon(Icons.tune), text: 'Siapkan'),
+          Tab(icon: Icon(Icons.play_circle_outline), text: 'Proses'),
+          Tab(icon: Icon(Icons.subtitles_outlined), text: 'Hasil'),
+        ]),
       ),
       body: TabBarView(
         controller: _tabs,
         physics: const NeverScrollableScrollPhysics(),
-        children: [_tabVideo(), _tabProses(), _tabHasil()],
+        children: [_tabSiapkan(), _tabProses(), _tabHasil()],
       ),
     );
   }
 
-  Widget _tabVideo() {
-    return ListView(padding: const EdgeInsets.all(12), children: [
-      FilledButton.icon(onPressed: running ? null : pickVideo, icon: const Icon(Icons.video_file), label: const Text('Pilih video (MP4/MKV)')),
-      if (uri != null) ...[
-        const SizedBox(height: 8),
-        Text('$name\n${vw}x$vh  •  ${durMs ~/ 60000} menit ${(durMs ~/ 1000) % 60} dtk'),
-        const SizedBox(height: 8),
-        if (previewBytes != null)
-          AspectRatio(
-            aspectRatio: previewAspect,
-            child: Stack(fit: StackFit.expand, children: [
-              Image.memory(previewBytes!, fit: BoxFit.fill, gaplessPlayback: true),
-              CustomPaint(painter: _CropPainter(xR, yR)),
-            ]),
-          ),
-        const Text('Geser waktu ke momen yang ADA subtitle-nya:'),
-        Slider(
-          value: previewT.clamp(0.0, math.max(1.0, durMs / 1000.0 - 1)).toDouble(),
-          min: 0,
-          max: math.max(1.0, durMs / 1000.0 - 1),
-          label: fmtSrt(previewT).substring(0, 8),
-          onChanged: (v) => setState(() => previewT = v),
-          onChangeEnd: (_) => loadPreview(),
-        ),
-        const Text('Atas – Bawah (kotak merah harus menutupi subtitle saja):'),
-        RangeSlider(values: yR, min: 0, max: 1, onChanged: (v) => setState(() => yR = v)),
-        const Text('Kiri – Kanan:'),
-        RangeSlider(values: xR, min: 0, max: 1, onChanged: (v) => setState(() => xR = v)),
-        const Divider(),
-        SwitchListTile(
-          title: const Text('Teks subtitle terang (putih/kuning)'),
-          subtitle: const Text('Matikan jika teksnya gelap'),
-          value: light,
-          onChanged: (v) => setState(() => light = v),
-        ),
-        Text('Ambang kecerahan teks: ${bright.round()} (turunkan jika teks redup/kekuningan)'),
-        Slider(value: bright, min: 120, max: 245, onChanged: (v) => setState(() => bright = v)),
-        Row(children: [
-          const Text('Interval: '),
-          DropdownButton<double>(
-            value: interval,
-            items: const [
-              DropdownMenuItem(value: 0.33, child: Text('0,33 dtk (teliti, lambat)')),
-              DropdownMenuItem(value: 0.5, child: Text('0,5 dtk (disarankan)')),
-              DropdownMenuItem(value: 1.0, child: Text('1 dtk (cepat, kasar)')),
-            ],
-            onChanged: (v) => setState(() => interval = v ?? 0.5),
-          ),
+  Widget _card(String title, List<Widget> children, {String? hint}) {
+    return Card(
+      margin: const EdgeInsets.only(bottom: 12),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(title, style: Theme.of(context).textTheme.titleMedium),
+          if (hint != null) Padding(padding: const EdgeInsets.only(top: 2), child: Text(hint, style: Theme.of(context).textTheme.bodySmall)),
+          const SizedBox(height: 8),
+          ...children,
         ]),
-        SwitchListTile(
-          title: const Text('Mode uji (hanya 60 detik dari waktu di atas)'),
-          value: testMode,
-          onChanged: (v) => setState(() => testMode = v),
+      ),
+    );
+  }
+
+  String _pct(double v) => '${(v * 100).round()}%';
+
+  Widget _tabSiapkan() {
+    return ListView(padding: const EdgeInsets.all(12), children: [
+      _card('1. Video', [
+        FilledButton.icon(onPressed: running ? null : pickVideo, icon: const Icon(Icons.video_file), label: const Text('Pilih video (MP4 / MKV)')),
+        if (uri == null && lastUri != null)
+          Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: OutlinedButton.icon(
+              onPressed: running ? null : () => _openUri(lastUri!),
+              icon: const Icon(Icons.history),
+              label: Text('Buka lagi: ${lastName.isEmpty ? 'video terakhir' : lastName}', overflow: TextOverflow.ellipsis),
+            ),
+          ),
+        if (uri != null)
+          Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: Text('$name\n${vw}x$vh  •  ${durMs ~/ 60000} menit ${(durMs ~/ 1000) % 60} dtk'),
+          ),
+      ]),
+      if (uri != null) ...[
+        _card('2. Pratinjau & waktu', [
+          if (previewBytes != null)
+            AspectRatio(
+              aspectRatio: previewAspect,
+              child: Stack(fit: StackFit.expand, children: [
+                Image.memory(previewBytes!, fit: BoxFit.fill, gaplessPlayback: true),
+                CustomPaint(painter: _CropPainter(_effX, _effY)),
+              ]),
+            ),
+          const SizedBox(height: 8),
+          Row(children: [
+            Expanded(
+              child: TextField(
+                controller: _timeCtl,
+                keyboardType: TextInputType.datetime,
+                decoration: const InputDecoration(labelText: 'Waktu (menit:detik)', hintText: '08:00', border: OutlineInputBorder(), isDense: true),
+                onSubmitted: (_) => applyTime(),
+              ),
+            ),
+            IconButton(onPressed: () => nudge(-5), icon: const Icon(Icons.replay_5)),
+            IconButton(onPressed: () => nudge(5), icon: const Icon(Icons.forward_5)),
+            FilledButton(onPressed: applyTime, child: const Text('Tampilkan')),
+          ]),
+        ], hint: 'Ketik waktu yang ADA subtitle-nya, mis. 08:00 atau 1:08:00.'),
+        _card('3. Area subtitle', [
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Posisi subtitle berpindah-pindah'),
+            subtitle: const Text('Baca seluruh layar (atas / tengah / bawah). Lebih lambat.'),
+            value: autoPos,
+            onChanged: (v) => _set(() => autoPos = v),
+          ),
+          if (!autoPos) ...[
+            Text('Atas – Bawah: ${_pct(yR.start)} – ${_pct(yR.end)}'),
+            RangeSlider(values: yR, min: 0, max: 1, onChanged: (v) => setState(() => yR = v), onChangeEnd: (_) => _persist()),
+            Text('Kiri – Kanan: ${_pct(xR.start)} – ${_pct(xR.end)}'),
+            RangeSlider(values: xR, min: 0, max: 1, onChanged: (v) => setState(() => xR = v), onChangeEnd: (_) => _persist()),
+            const Text('Kotak merah harus menutupi subtitle saja (tanpa tulisan lain).', style: TextStyle(fontSize: 12)),
+          ],
+        ]),
+        _card('4. Jenis tulisan subtitle', [
+          SegmentedButton<int>(
+            segments: const [
+              ButtonSegment(value: 0, label: Text('Latin')),
+              ButtonSegment(value: 1, label: Text('Jepang')),
+              ButtonSegment(value: 2, label: Text('Keduanya')),
+            ],
+            selected: {script},
+            onSelectionChanged: (s) => _set(() => script = s.first),
+          ),
+          const SizedBox(height: 4),
+          const Text(
+            'Latin: huruf Jepang diabaikan. Jepang: hanya baris berhuruf Jepang. Keduanya: semua dibaca.',
+            style: TextStyle(fontSize: 12),
+          ),
+          if (script == 0)
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Buang area tulisan Jepang (lebih akurat)'),
+              subtitle: const Text('Mencegah huruf Jepang terbaca sebagai huruf Latin aneh. Sedikit lebih lambat.'),
+              value: strictLatin,
+              onChanged: (v) => _set(() => strictLatin = v),
+            ),
+        ]),
+        _card('5. Tes', [
+          OutlinedButton.icon(onPressed: running ? null : testOcr, icon: const Icon(Icons.science), label: const Text('Tes OCR pada waktu ini')),
+          if (testResult.isNotEmpty) Padding(padding: const EdgeInsets.only(top: 8), child: Text(testResult, style: const TextStyle(fontSize: 16))),
+        ], hint: 'Hasil harus sama dengan subtitle di video. Coba beberapa waktu berbeda.'),
+        Card(
+          margin: const EdgeInsets.only(bottom: 12),
+          child: ExpansionTile(
+            title: const Text('Pengaturan lanjutan'),
+            childrenPadding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+            children: [
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Teks subtitle terang (putih/kuning)'),
+                subtitle: const Text('Matikan jika teksnya gelap'),
+                value: light,
+                onChanged: (v) => _set(() => light = v),
+              ),
+              Text('Ambang kecerahan teks: ${bright.round()}  (turunkan jika teks redup, naikkan jika latar terang)'),
+              Slider(value: bright, min: 120, max: 245, onChanged: (v) => setState(() => bright = v), onChangeEnd: (_) => _persist()),
+              Row(children: [
+                const Text('Interval: '),
+                DropdownButton<double>(
+                  value: interval,
+                  items: const [
+                    DropdownMenuItem(value: 0.33, child: Text('0,33 dtk (teliti)')),
+                    DropdownMenuItem(value: 0.5, child: Text('0,5 dtk (seimbang)')),
+                    DropdownMenuItem(value: 1.0, child: Text('1 dtk (cepat, kasar)')),
+                  ],
+                  onChanged: (v) => _set(() => interval = v ?? 0.33),
+                ),
+              ]),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Mode cepat adaptif'),
+                subtitle: const Text('Periksa tiap 2 langkah, rapatkan hanya di dekat pergantian teks (±1,5–2x lebih cepat). Subtitle < 0,7 dtk bisa terlewat.'),
+                value: adaptive,
+                onChanged: (v) => _set(() => adaptive = v),
+              ),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Mode uji (60 detik dari waktu di atas)'),
+                subtitle: const Text('Matikan untuk memproses seluruh video.'),
+                value: testMode,
+                onChanged: (v) => _set(() => testMode = v),
+              ),
+            ],
+          ),
         ),
-        OutlinedButton.icon(onPressed: testOcr, icon: const Icon(Icons.science), label: const Text('Tes OCR pada frame ini')),
-        if (testResult.isNotEmpty) Padding(padding: const EdgeInsets.all(8), child: Text(testResult, style: const TextStyle(fontSize: 16))),
-        FilledButton(onPressed: () => _tabs.animateTo(1), child: const Text('Lanjut ke Proses →')),
+        FilledButton.icon(onPressed: () => _tabs.animateTo(1), icon: const Icon(Icons.arrow_forward), label: const Text('Lanjut ke Proses')),
+        const SizedBox(height: 24),
       ],
     ]);
   }
 
   Widget _tabProses() {
+    final scriptName = ['Latin', 'Jepang', 'Latin + Jepang'][script];
+    final area = autoPos ? 'seluruh layar' : 'kotak ${_pct(yR.start)}–${_pct(yR.end)} (atas–bawah)';
     return ListView(padding: const EdgeInsets.all(12), children: [
-      Text(uri == null ? 'Pilih video dulu di tab 1.' : '$name\nMode: ${testMode ? 'UJI 60 detik' : 'PENUH'}  •  interval $interval dtk'),
-      const SizedBox(height: 12),
+      _card('Ringkasan', [
+        Text(uri == null
+            ? 'Pilih video dulu di tab Siapkan.'
+            : '$name\n'
+                'Mode: ${testMode ? 'UJI 60 detik' : 'PENUH'}\n'
+                'Tulisan: $scriptName\n'
+                'Area: $area\n'
+                'Interval: $interval dtk${adaptive ? ' (cepat adaptif)' : ''}'),
+      ]),
       Row(children: [
         Expanded(
           child: FilledButton.icon(
@@ -773,13 +1238,17 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       LinearProgressIndicator(value: (running || progress > 0) ? progress : 0.0),
       const SizedBox(height: 8),
       Text(status),
-      const SizedBox(height: 16),
-      const Text(
-        'Biarkan aplikasi tetap terbuka dan layar menyala selama proses (layar otomatis ditahan menyala). '
-        'Jika terhenti, tekan Mulai lagi: proses melanjutkan dari hasil tersimpan. '
-        'Waktu subtitle adalah perkiraan dari frame yang diperiksa, bukan timestamp asli, dan akurasi OCR tidak 100%.',
-        style: TextStyle(color: Colors.grey),
-      ),
+      const SizedBox(height: 12),
+      if (!running && samples.isNotEmpty)
+        Align(alignment: Alignment.centerLeft, child: TextButton(onPressed: clearTemp, child: const Text('Hapus hasil sementara (mulai dari awal)'))),
+      const SizedBox(height: 8),
+      _card('Catatan', [
+        const Text(
+          '• Boleh ditinggal: tekan Home atau kunci layar, proses tetap jalan (ada notifikasi progres).\n'
+          '• Jangan geser/tutup app dari daftar aplikasi terbaru. Jika terlanjur, buka lagi lalu tekan Mulai: proses melanjutkan dari hasil tersimpan.\n'
+          '• Waktu subtitle adalah perkiraan dari frame yang diperiksa, bukan timestamp asli. Akurasi OCR tidak 100%, periksa hasilnya di tab Hasil.',
+        ),
+      ]),
     ]);
   }
 
@@ -792,10 +1261,11 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     return Column(children: [
       Padding(
         padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-        child: Row(children: [
-          Expanded(child: Text('${subs.length} subtitle • $nw ⚠')),
-          const Text('Hanya ⚠'),
-          Switch(value: onlyWarn, onChanged: (v) => setState(() => onlyWarn = v)),
+        child: Wrap(spacing: 8, runSpacing: 4, crossAxisAlignment: WrapCrossAlignment.center, children: [
+          Text('${subs.length} subtitle • $nw ⚠'),
+          FilterChip(label: const Text('Hanya ⚠'), selected: onlyWarn, onSelected: (v) => setState(() => onlyWarn = v)),
+          ActionChip(label: const Text('Perbaiki otomatis'), onPressed: subs.isEmpty ? null : autoFix),
+          ActionChip(label: const Text('Cari & ganti'), onPressed: subs.isEmpty ? null : findReplace),
         ]),
       ),
       Expanded(
