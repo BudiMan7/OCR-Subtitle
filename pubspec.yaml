@@ -13,3 +13,5 @@ dependencies:
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/kamus_id.txt
