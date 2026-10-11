@@ -306,19 +306,69 @@ void main() {
     expect(pickRecovered(cur, ['$cur 12345 @@@', '$cur 12345 @@@']), isNull);
   });
 
-  test('ASS valid: gaya, posisi, dua subtitle bersamaan', () {
-    final a = mk(1, 3, 'Bawah');
+  test('ASS: ukuran huruf tetap, posisi tetap per lajur, tanpa \\pos', () {
+    final a = mk(1, 3, 'Bawah 1');
+    final a2 = mk(4, 6, 'Bawah 2');
+    a2.box = [0.1, 0.78, 0.9, 0.87]; // kotak sedikit berbeda: hasil tetap sama
     final b = mk(1, 3, 'Atas {x}');
     b.box = [0.2, 0.08, 0.8, 0.13];
-    b.area = 1;
-    final out = buildAss([a, b], width: 1280, height: 720);
+    final out = buildAss([a, a2, b], width: 1280, height: 720);
     expect(out.contains('[Script Info]'), isTrue);
     expect(out.contains('PlayResX: 1280'), isTrue);
-    expect('Style: '.allMatches(out).length, 2);
-    expect('Dialogue: '.allMatches(out).length, 2);
-    expect(out.contains(r'\an2\pos(640,'), isTrue);
-    expect(out.contains('Atas (x)'), isTrue);
+    expect('Style: '.allMatches(out).length, 2); // Atas + Bawah
+    expect('Dialogue: '.allMatches(out).length, 3);
+    expect(out.contains(r'\pos'), isFalse);
+    expect(out.contains(',Atas,,0,0,0,,Atas (x)'), isTrue);
+    expect(out.contains(',Bawah,,0,0,0,,Bawah 1'), isTrue);
+    // semua Style memakai ukuran huruf yang sama
+    final sizes = RegExp(r'Style: \w+,Arial,(\d+),').allMatches(out).map((m) => m.group(1)).toSet();
+    expect(sizes.length, 1);
+    expect(buildAss([a], width: 1280, height: 720, fontPx: 40).contains('Arial,40,'), isTrue);
     expect(out.contains('0:00:01.00,0:00:03.00'), isTrue);
+  });
+
+  test('watermark: alamat web dibuang dari baris subtitle', () {
+    final st = stripDomains('Mereka yang tunduk kepada kita diperbolehkan rajanime.cet');
+    expect(st.text, 'Mereka yang tunduk kepada kita diperbolehkan');
+    expect(st.cutR, greaterThan(0.1));
+    expect(stripDomains('Aku tidak tahu.Dia pergi.').text, 'Aku tidak tahu.Dia pergi.');
+    expect(stripDomains('rajanime.com').text, '');
+    final samples = [
+      Sample(1, [Cand('Kita pergi sekarang rajanime.com', 0.1, 0.1, 0.9, 0.15)]),
+      Sample(2, [Cand('rajanime.com', 0.4, 0.05, 0.6, 0.08)]),
+    ];
+    stripOverlays(samples);
+    expect(samples[0].cands[0].text, 'Kita pergi sekarang');
+    expect(samples[0].cands[0].r, lessThan(0.9));
+    expect(samples[1].cands, isEmpty);
+  });
+
+  test('watermark tanpa titik: token HURUF BESAR yang selalu di ujung baris dibuang; kata biasa aman', () {
+    final samples = <Sample>[];
+    for (var i = 0; i < 12; i++) {
+      samples.add(Sample(i.toDouble(), [Cand('Kalimat nomor $i yang berbeda RAJANIME', 0.1, 0.1, 0.9, 0.15)]));
+    }
+    for (var i = 0; i < 12; i++) {
+      samples.add(Sample(20.0 + i, [Cand('Kalimat lain $i dengan kita', 0.1, 0.8, 0.9, 0.85)]));
+    }
+    stripOverlays(samples);
+    expect(samples[0].cands[0].text, 'Kalimat nomor 0 yang berbeda');
+    expect(samples[13].cands[0].text, 'Kalimat lain 1 dengan kita');
+  });
+
+  test('referensi ASS dibaca (tag, \\N, gambar vektor dilewati) dan dikenali otomatis', () {
+    const ass = '[Script Info]\nTitle: x\n\n[V4+ Styles]\nFormat: Name, Fontname\nStyle: Default,Arial\n\n'
+        '[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n'
+        'Dialogue: 0,0:00:01.00,0:00:03.50,Default,,0,0,0,,{\\i1}Hello{\\i0}, there\\Nfriend\n'
+        'Dialogue: 0,0:01:02.50,0:01:04.00,Default,,0,0,0,,{\\an8}Second line\n'
+        'Dialogue: 0,0:00:10.00,0:00:12.00,Default,,0,0,0,,{\\p1}m 0 0 l 10 10\n'
+        'Comment: 0,0:00:20.00,0:00:22.00,Default,,0,0,0,,bukan dialog\n';
+    final c = parseReference(ass);
+    expect(c.length, 2);
+    expect(c[0].text, 'Hello, there\nfriend');
+    expect(c[0].end, closeTo(3.5, 1e-9));
+    expect(c[1].start, closeTo(62.5, 1e-9));
+    expect(parseReference('1\n00:00:01,000 --> 00:00:02,000\nHi\n').length, 1);
   });
 
   test('simpan & muat Sub (JSON) termasuk data lama', () {
