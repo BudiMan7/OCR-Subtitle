@@ -8,9 +8,7 @@ import 'package:flutter/services.dart';
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 
 // =====================================================================
-//  HARDSUB OCR → SRT / ASS
-//  Alur: pilih video → atur area/jenis tulisan → OCR (di HP, offline)
-//        → koreksi → ekspor .srt / .ass ke folder Download.
+//  HARDSUB OCR → SRT / ASS  +  Analisis Kamus
 // =====================================================================
 
 const double kChangeFrac = 0.0015;
@@ -20,13 +18,51 @@ const double kMaxDropoutSec = 0.6;
 const double kMinDuration = 0.7;
 const int kSaveEvery = 100;
 
-/// Watermark yang selalu muncul. Dibandingkan secara fuzzy (bukan exact match).
+/// Watermark yang selalu muncul. Dibandingkan secara fuzzy.
 const List<String> kWatermarkKeys = [
   'rajanime',
   'rajanimecom',
 ];
 
+/// Nama karakter / istilah yang TIDAK boleh dikoreksi kamus.
+const Set<String> kProtectedWords = {
+  'ilun', 'phuzeron', 'redof', 'hyss', 'gamillas', 'yamato',
+  'ghader', 'thalan', 'abelt', 'dessler', 'kodai', 'mori',
+};
+
 const MethodChannel _ch = MethodChannel('hardsub/native');
+
+// =====================================================================
+//  KAMUS
+// =====================================================================
+Set<String> kKamus = {};
+Map<int, List<String>> kKamusByLen = {};
+bool kKamusReady = false;
+
+Future<void> loadKamus() async {
+  if (kKamusReady) return;
+  try {
+    final s = await rootBundle.loadString('assets/kamus_id.txt');
+    final words = s
+        .split('\n')
+        .map((l) => l.trim().toLowerCase())
+        .where((l) => l.isNotEmpty)
+        .where((l) => !l.startsWith('#'))
+        .where((l) => !l.startsWith('.'))
+        // hanya huruf kecil dan tanda hubung di tengah, panjang >= 3
+        .where((l) => RegExp(r'^[a-z][a-z-]*[a-z]$').hasMatch(l))
+        .where((l) => l.length >= 3)
+        .toSet();
+    kKamus = words;
+    kKamusByLen = {};
+    for (final w in words) {
+      kKamusByLen.putIfAbsent(w.length, () => []).add(w);
+    }
+    kKamusReady = true;
+  } catch (_) {
+    // file tidak ada → aplikasi tetap jalan tanpa kamus
+  }
+}
 
 // ----------------------- util waktu -----------------------
 String fmtSrt(double t) {
@@ -121,7 +157,7 @@ String cleanText(String t, int mode) {
   return out.join('\n');
 }
 
-// ----------------------- deteksi watermark -----------------------
+// ----------------------- watermark -----------------------
 bool looksLikeWatermark(String text) {
   final n = text.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '');
   if (n.length < 4) return false;
@@ -146,8 +182,6 @@ bool looksLikeWatermark(String text) {
   return false;
 }
 
-/// Potong watermark yang menempel di dalam baris.
-/// Contoh: "selamat kepadamuime.com" -> "selamat kepadamu"
 String stripWatermark(String text) {
   var s = text;
   s = s.replaceAll(
@@ -212,14 +246,9 @@ bool similar(String a, String b) {
 class Sample {
   double t;
   String text;
-  int zone;
-  Sample(this.t, this.text, [this.zone = 0]);
-  Map<String, dynamic> toJson() => {'t': t, 'text': text, 'z': zone};
-  factory Sample.fromJson(Map<String, dynamic> j) => Sample(
-        (j['t'] as num).toDouble(),
-        j['text'] as String,
-        (j['z'] as num?)?.toInt() ?? 0,
-      );
+  Sample(this.t, this.text);
+  Map<String, dynamic> toJson() => {'t': t, 'text': text};
+  factory Sample.fromJson(Map<String, dynamic> j) => Sample((j['t'] as num).toDouble(), j['text'] as String);
 }
 
 class Sub {
@@ -275,7 +304,7 @@ class _Ln {
   _Ln(this.text, this.box);
 }
 
-// ----------------------- penggabungan sampel -> subtitle -----------------------
+// ----------------------- merge -----------------------
 List<Sub> _mergeOneZone(List<Sample> samples, double interval, int zone) {
   const eps = 1e-6;
   final groups = <_G>[];
@@ -415,7 +444,6 @@ String buildSrt(List<Sub> subs) {
 }
 
 // ----------------------- ASS -----------------------
-
 List<String> _wrapText(String text, int maxChars, int maxLines) {
   final out = <String>[];
   for (var raw in text.split('\n')) {
@@ -506,7 +534,7 @@ String buildAss(List<Sub> subs, int vw, int vh, {int fontSize = 48}) {
   return b.toString();
 }
 
-// ----------------------- koreksi otomatis (frekuensi) -----------------------
+// ----------------------- koreksi frekuensi -----------------------
 final RegExp _wordRe = RegExp(r'[A-Za-z0-9]+');
 
 String _canon(String w) {
@@ -546,6 +574,115 @@ Map<String, String> buildFixes(List<Sub> subs) {
     if (b != null && b != e.key && (freq[b] ?? 0) >= e.value * 3) fixes[e.key] = b;
   }
   return fixes;
+}
+
+// =====================================================================
+//  ANALISIS KAMUS
+// =====================================================================
+class UsulanKoreksi {
+  final String asli;
+  final String usul;
+  final String alasan;
+  bool dicentang;
+  UsulanKoreksi(this.asli, this.usul, this.alasan, {this.dicentang = true});
+}
+
+/// Apakah kata ini dilindungi (nama karakter/istilah)?
+bool _isProtected(String w) => kProtectedWords.contains(w.toLowerCase());
+
+/// Apakah kata ini ada di kamus?
+bool _inKamus(String w) => kKamus.contains(w.toLowerCase());
+
+/// Berisi angka?
+bool _hasDigit(String w) => RegExp(r'[0-9]').hasMatch(w);
+
+/// Perbaiki angka → huruf: d1 → di, m0kan → makan
+String _fixDigits(String w) {
+  return w
+      .replaceAll('0', 'o')
+      .replaceAll('1', 'l')
+      .replaceAll('3', 'e')
+      .replaceAll('4', 'a')
+      .replaceAll('5', 's')
+      .replaceAll('7', 't');
+}
+
+/// Punya huruf besar di tengah? (indikasi nama)
+bool _hasMidUpper(String w) {
+  if (w.length < 2) return false;
+  return w.substring(1).contains(RegExp(r'[A-Z]'));
+}
+
+/// Cari kandidat terdekat di kamus. Return null kalau tidak ada.
+String? _cariKandidat(String w) {
+  final lower = w.toLowerCase();
+  var bestDist = 3;
+  String? best;
+  for (var len = lower.length - 2; len <= lower.length + 2; len++) {
+    final list = kKamusByLen[len];
+    if (list == null) continue;
+    for (final k in list) {
+      final d = _lev(lower, k);
+      if (d < bestDist) {
+        bestDist = d;
+        best = k;
+        if (d == 1) break;
+      }
+    }
+    if (bestDist == 1) break;
+  }
+  if (best == null) return null;
+  if (bestDist > 2) return null;
+  return best;
+}
+
+/// Analisis semua subtitle. Mengembalikan daftar usulan koreksi.
+List<UsulanKoreksi> analyzeText(List<Sub> subs) {
+  if (kKamus.isEmpty) return [];
+
+  // kumpulkan semua kata unik
+  final kataSet = <String>{};
+  for (final s in subs) {
+    for (final m in _wordRe.allMatches(s.text)) {
+      kataSet.add(m.group(0)!);
+    }
+  }
+
+  final usulan = <UsulanKoreksi>[];
+
+  for (final w in kataSet) {
+    // aturan 1: kata dilindungi → skip
+    if (_isProtected(w)) continue;
+    // kata terlalu pendek → skip
+    if (w.length < 3) continue;
+
+    final lower = w.toLowerCase();
+
+    // sudah ada di kamus → skip
+    if (_inKamus(lower)) continue;
+
+    // nama (huruf besar di tengah) → skip, biarkan
+    if (_hasMidUpper(w)) continue;
+
+    // aturan 2: ada angka → coba perbaiki angka jadi huruf dulu
+    if (_hasDigit(w)) {
+      final fixed = _fixDigits(lower);
+      if (kKamus.contains(fixed)) {
+        usulan.add(UsulanKoreksi(w, _matchCase(w, fixed), 'angka → huruf'));
+        continue;
+      }
+    }
+
+    // aturan 3: cari kandidat terdekat
+    final kand = _cariKandidat(lower);
+    if (kand != null) {
+      usulan.add(UsulanKoreksi(w, _matchCase(w, kand), 'mirip kata di kamus'));
+    }
+    // kalau tidak ada kandidat → biarkan (mungkin nama/istilah asing)
+  }
+
+  usulan.sort((a, b) => a.asli.toLowerCase().compareTo(b.asli.toLowerCase()));
+  return usulan;
 }
 
 // =====================================================================
@@ -591,7 +728,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
 
   RangeValues yR = const RangeValues(0.72, 0.92);
   RangeValues xR = const RangeValues(0.05, 0.95);
-  double zoneSplit = 0.5; // garis pemisah zona atas/bawah (0..1)
+  double zoneSplit = 0.5;
   int script = 0;
   bool autoPos = false;
   bool strictLatin = true;
@@ -618,6 +755,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   @override
   void initState() {
     super.initState();
+    loadKamus();
     _init();
   }
 
@@ -775,8 +913,6 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     return area <= 0 ? 0 : (i.width * i.height) / area;
   }
 
-  /// OCR satu file untuk satu zona (0 = atas, 1 = bawah).
-  /// Pemilihan baris memakai `zoneSplit` (0..1).
   Future<String> _ocrFile(String path, double imgH, int zone) async {
     final input = InputImage.fromFilePath(path);
     final lines = <_Ln>[];
@@ -808,7 +944,6 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       }
     }
 
-    // filter: hanya baris di zona ini
     final kept = <_Ln>[];
     for (final ln in lines) {
       final cy = ln.box.center.dy / imgH;
@@ -1074,18 +1209,18 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
             ? 'Dihentikan di $n/$total. Tekan Mulai untuk melanjutkan.'
             : 'Selesai: $n frame, $nonEmpty berisi teks, ${merged.length} subtitle ($zoneCount zona).' +
                 (frameFails > 0 ? ' ($frameFails frame gagal dibaca)' : '') +
-                (nonEmpty == 0 ? ' PERINGATAN: tidak ada teks terbaca. Cek area, jenis tulisan, dan ambang kecerahan.' : '');
+                (nonEmpty == 0 ? ' PERINGATAN: tidak ada teks terbaca.' : '');
       });
       await saveSubs();
       if (!cancel) {
         try {
-          await _ch.invokeMethod('notifyDone', {'text': 'Selesai: ${merged.length} subtitle. Ketuk untuk melihat hasil.'});
+          await _ch.invokeMethod('notifyDone', {'text': 'Selesai: ${merged.length} subtitle.'});
         } catch (_) {}
         if (merged.isNotEmpty) _tabs.animateTo(2);
       }
     } catch (e) {
       await checkpoint();
-      setState(() => status = 'Berhenti karena error: $e (hasil sementara tersimpan, tekan Mulai untuk melanjutkan)');
+      setState(() => status = 'Berhenti karena error: $e');
     } finally {
       try {
         await _ch.invokeMethod('serviceStop');
@@ -1130,9 +1265,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
           title: Text('${ext.toUpperCase()} tersimpan'),
           content: Text(
             '$where\n\n'
-            '${isAss ? "Format ASS: zona atas di atas, zona bawah di bawah. Aktifkan HW+ / SW decoder di MX Player." : "Format SRT: teks polos, semua di bawah."}\n\n'
-            'Di MX Player: menu subtitle → Buka → pilih file ini dari folder Download.'
-            '${testMode ? '\n\nIni hasil UJI. Matikan "Mode uji" di tab Siapkan untuk memproses seluruh video.' : ''}',
+            '${isAss ? "Format ASS: zona atas di atas, zona bawah di bawah." : "Format SRT: teks polos."}',
           ),
           actions: [TextButton(onPressed: () => Navigator.pop(c), child: const Text('OK'))],
         ),
@@ -1145,6 +1278,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   Future<void> exportSrt() => _export('srt');
   Future<void> exportAss() => _export('ass');
 
+  // ---- perbaikan otomatis (frekuensi) ----
   Future<void> autoFix() async {
     final fixes = buildFixes(subs);
     if (fixes.isEmpty) {
@@ -1174,6 +1308,83 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     setState(() {});
     await saveSubs();
     _snack('Koreksi diterapkan.');
+  }
+
+  // ---- analisis kamus ----
+  Future<void> analyzeKamus() async {
+    if (!kKamusReady) await loadKamus();
+    if (kKamus.isEmpty) {
+      _snack('Kamus tidak tersedia. Pastikan assets/kamus_id.txt ada.');
+      return;
+    }
+    if (subs.isEmpty) return;
+
+    setState(() => status = 'Menganalisis kamus...');
+
+    final usulan = analyzeText(subs);
+    if (usulan.isEmpty) {
+      _snack('Tidak ada kata yang perlu dikoreksi.');
+      return;
+    }
+
+    // dialog
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (c) => StatefulBuilder(
+        builder: (c, setD) {
+          return AlertDialog(
+            title: Text('${usulan.length} usulan koreksi'),
+            content: SizedBox(
+              width: double.maxFinite,
+              child: ListView.builder(
+                shrinkWrap: true,
+                itemCount: usulan.length,
+                itemBuilder: (c, i) {
+                  final u = usulan[i];
+                  return CheckboxListTile(
+                    dense: true,
+                    value: u.dicentang,
+                    title: Text('${u.asli}  →  ${u.usul}'),
+                    subtitle: Text(u.alasan),
+                    onChanged: (v) => setD(() => u.dicentang = v ?? false),
+                  );
+                },
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(c),
+                child: const Text('Batal'),
+              ),
+              FilledButton(
+                onPressed: () {
+                  // terapkan
+                  var n = 0;
+                  for (final s in subs) {
+                    s.text = s.text.replaceAllMapped(_wordRe, (m) {
+                      final w = m.group(0)!;
+                      for (final u in usulan) {
+                        if (u.dicentang && u.asli == w) {
+                          n++;
+                          return u.usul;
+                        }
+                      }
+                      return w;
+                    });
+                  }
+                  Navigator.pop(c);
+                  setState(() {});
+                  saveSubs();
+                  _snack('$n kata dikoreksi.');
+                },
+                child: const Text('Terapkan yg dicentang'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
   }
 
   Future<void> findReplace() async {
@@ -1399,7 +1610,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
           SwitchListTile(
             contentPadding: EdgeInsets.zero,
             title: const Text('Posisi subtitle berpindah-pindah'),
-            subtitle: const Text('Baca seluruh layar (atas / tengah / bawah). Zona otomatis dipisah.'),
+            subtitle: const Text('Baca seluruh layar (atas / tengah / bawah).'),
             value: autoPos,
             onChanged: (v) => _set(() => autoPos = v),
           ),
@@ -1408,7 +1619,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
             RangeSlider(values: yR, min: 0, max: 1, onChanged: (v) => setState(() => yR = v), onChangeEnd: (_) => _persist()),
             Text('Kiri – Kanan: ${_pct(xR.start)} – ${_pct(xR.end)}'),
             RangeSlider(values: xR, min: 0, max: 1, onChanged: (v) => setState(() => xR = v), onChangeEnd: (_) => _persist()),
-            const Text('Kotak merah harus menutupi subtitle saja (tanpa tulisan lain).', style: TextStyle(fontSize: 12)),
+            const Text('Kotak merah harus menutupi subtitle saja.', style: TextStyle(fontSize: 12)),
           ],
           const SizedBox(height: 8),
           Text('Garis pemisah zona atas/bawah: ${_pct(zoneSplit)}'),
@@ -1421,7 +1632,6 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
             onChanged: (v) => setState(() => zoneSplit = v),
             onChangeEnd: (_) => _persist(),
           ),
-          const Text('Baris di ATAS garis → zona 0 (ditampilkan di atas). Baris di BAWAH → zona 1 (di bawah).', style: TextStyle(fontSize: 12)),
         ]),
         _card('4. Jenis tulisan subtitle', [
           SegmentedButton<int>(
@@ -1433,16 +1643,10 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
             selected: {script},
             onSelectionChanged: (s) => _set(() => script = s.first),
           ),
-          const SizedBox(height: 4),
-          const Text(
-            'Latin: huruf Jepang diabaikan. Jepang: hanya baris berhuruf Jepang. Keduanya: semua dibaca.',
-            style: TextStyle(fontSize: 12),
-          ),
           if (script == 0)
             SwitchListTile(
               contentPadding: EdgeInsets.zero,
-              title: const Text('Buang area tulisan Jepang (lebih akurat)'),
-              subtitle: const Text('Mencegah huruf Jepang terbaca sebagai huruf Latin aneh. Sedikit lebih lambat.'),
+              title: const Text('Buang area tulisan Jepang'),
               value: strictLatin,
               onChanged: (v) => _set(() => strictLatin = v),
             ),
@@ -1450,7 +1654,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         _card('5. Tes', [
           OutlinedButton.icon(onPressed: running ? null : testOcr, icon: const Icon(Icons.science), label: const Text('Tes OCR pada waktu ini')),
           if (testResult.isNotEmpty) Padding(padding: const EdgeInsets.only(top: 8), child: Text(testResult, style: const TextStyle(fontSize: 16))),
-        ], hint: 'Hasil harus sama dengan subtitle di video. Coba beberapa waktu berbeda.'),
+        ]),
         Card(
           margin: const EdgeInsets.only(bottom: 12),
           child: ExpansionTile(
@@ -1459,21 +1663,20 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
             children: [
               SwitchListTile(
                 contentPadding: EdgeInsets.zero,
-                title: const Text('Teks subtitle terang (putih/kuning)'),
-                subtitle: const Text('Matikan jika teksnya gelap'),
+                title: const Text('Teks subtitle terang'),
                 value: light,
                 onChanged: (v) => _set(() => light = v),
               ),
-              Text('Ambang kecerahan teks: ${bright.round()}  (turunkan jika teks redup, naikkan jika latar terang)'),
+              Text('Ambang kecerahan: ${bright.round()}'),
               Slider(value: bright, min: 120, max: 245, onChanged: (v) => setState(() => bright = v), onChangeEnd: (_) => _persist()),
               Row(children: [
                 const Text('Interval: '),
                 DropdownButton<double>(
                   value: interval,
                   items: const [
-                    DropdownMenuItem(value: 0.33, child: Text('0,33 dtk (teliti)')),
-                    DropdownMenuItem(value: 0.5, child: Text('0,5 dtk (seimbang)')),
-                    DropdownMenuItem(value: 1.0, child: Text('1 dtk (cepat, kasar)')),
+                    DropdownMenuItem(value: 0.33, child: Text('0,33 dtk')),
+                    DropdownMenuItem(value: 0.5, child: Text('0,5 dtk')),
+                    DropdownMenuItem(value: 1.0, child: Text('1 dtk')),
                   ],
                   onChanged: (v) => _set(() => interval = v ?? 0.33),
                 ),
@@ -1481,14 +1684,12 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
               SwitchListTile(
                 contentPadding: EdgeInsets.zero,
                 title: const Text('Mode cepat adaptif'),
-                subtitle: const Text('Periksa tiap 2 langkah, rapatkan hanya di dekat pergantian teks (±1,5–2x lebih cepat).'),
                 value: adaptive,
                 onChanged: (v) => _set(() => adaptive = v),
               ),
               SwitchListTile(
                 contentPadding: EdgeInsets.zero,
-                title: const Text('Mode uji (60 detik dari waktu di atas)'),
-                subtitle: const Text('Matikan untuk memproses seluruh video.'),
+                title: const Text('Mode uji (60 detik)'),
                 value: testMode,
                 onChanged: (v) => _set(() => testMode = v),
               ),
@@ -1503,7 +1704,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
 
   Widget _tabProses() {
     final scriptName = ['Latin', 'Jepang', 'Latin + Jepang'][script];
-    final area = autoPos ? 'seluruh layar' : 'kotak ${_pct(yR.start)}–${_pct(yR.end)} (atas–bawah)';
+    final area = autoPos ? 'seluruh layar' : 'kotak ${_pct(yR.start)}–${_pct(yR.end)}';
     return ListView(padding: const EdgeInsets.all(12), children: [
       _card('Ringkasan', [
         Text(uri == null
@@ -1512,8 +1713,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
                 'Mode: ${testMode ? 'UJI 60 detik' : 'PENUH'}\n'
                 'Tulisan: $scriptName\n'
                 'Area: $area\n'
-                'Pemisah zona: ${_pct(zoneSplit)}\n'
-                'Interval: $interval dtk${adaptive ? ' (cepat adaptif)' : ''}'),
+                'Interval: $interval dtk${adaptive ? ' (adaptif)' : ''}'),
       ]),
       Row(children: [
         Expanded(
@@ -1532,15 +1732,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       Text(status),
       const SizedBox(height: 12),
       if (!running && samples.isNotEmpty)
-        Align(alignment: Alignment.centerLeft, child: TextButton(onPressed: clearTemp, child: const Text('Hapus hasil sementara (mulai dari awal)'))),
-      const SizedBox(height: 8),
-      _card('Catatan', [
-        const Text(
-          '• Boleh ditinggal: tekan Home atau kunci layar, proses tetap jalan (ada notifikasi progres).\n'
-          '• Jangan geser/tutup app dari daftar aplikasi terbaru. Jika terlanjur, buka lagi lalu tekan Mulai: proses melanjutkan dari hasil tersimpan.\n'
-          '• Baris di atas garis pemisah ditampilkan sebagai subtitle atas, di bawah garis sebagai subtitle bawah (saat ekspor ASS).',
-        ),
-      ]),
+        Align(alignment: Alignment.centerLeft, child: TextButton(onPressed: clearTemp, child: const Text('Hapus hasil sementara'))),
     ]);
   }
 
@@ -1557,6 +1749,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
           Text('${subs.length} subtitle • $nw ⚠'),
           FilterChip(label: const Text('Hanya ⚠'), selected: onlyWarn, onSelected: (v) => setState(() => onlyWarn = v)),
           ActionChip(label: const Text('Perbaiki otomatis'), onPressed: subs.isEmpty ? null : autoFix),
+          ActionChip(label: const Text('Analisis kamus'), onPressed: subs.isEmpty ? null : analyzeKamus),
           ActionChip(label: const Text('Cari & ganti'), onPressed: subs.isEmpty ? null : findReplace),
         ]),
       ),
@@ -1616,7 +1809,6 @@ class _CropPainter extends CustomPainter {
           ..color = Colors.red
           ..style = PaintingStyle.stroke
           ..strokeWidth = 2);
-    // garis pemisah zona
     final yLine = split * size.height;
     canvas.drawLine(
       Offset(0, yLine),
