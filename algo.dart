@@ -837,6 +837,66 @@ List<Cue> parseSrtFile(String src) {
   return cues;
 }
 
+/// Baca file .ass/.ssa (baris Dialogue). Gambar vektor (\p1) dilewati; tag {..} dibuang.
+List<Cue> parseAssFile(String src) {
+  final s = src.replaceAll(String.fromCharCode(0xFEFF), '').replaceAll('\r\n', '\n').replaceAll('\r', '\n');
+  var inEvents = false;
+  var nFmt = 0, iS = -1, iE = -1, iT = -1;
+  final cues = <Cue>[];
+  final timeRe = RegExp(r'^(\d+):(\d{1,2}):(\d{1,2})[.,](\d{1,3})$');
+  double? tm(String x) {
+    final m = timeRe.firstMatch(x.trim());
+    if (m == null) return null;
+    final frac = int.parse(m.group(4)!.padRight(3, '0'));
+    return int.parse(m.group(1)!) * 3600 + int.parse(m.group(2)!) * 60 + int.parse(m.group(3)!) + frac / 1000;
+  }
+
+  for (final line in s.split('\n')) {
+    final t = line.trim();
+    if (t.startsWith('[')) {
+      inEvents = t.toLowerCase() == '[events]';
+      continue;
+    }
+    if (!inEvents) continue;
+    final low = t.toLowerCase();
+    if (low.startsWith('format:')) {
+      final f = t.substring(7).split(',').map((e) => e.trim().toLowerCase()).toList();
+      nFmt = f.length;
+      iS = f.indexOf('start');
+      iE = f.indexOf('end');
+      iT = f.indexOf('text');
+      continue;
+    }
+    if (!low.startsWith('dialogue:') || iS < 0 || iE < 0 || iT < 0 || nFmt == 0) continue;
+    var body = t.substring(9).trimLeft();
+    final parts = <String>[];
+    while (parts.length < nFmt - 1) {
+      final k = body.indexOf(',');
+      if (k < 0) break;
+      parts.add(body.substring(0, k));
+      body = body.substring(k + 1);
+    }
+    parts.add(body);
+    if (parts.length != nFmt) continue;
+    final st = tm(parts[iS]);
+    final en = tm(parts[iE]);
+    if (st == null || en == null || en <= st) continue;
+    var text = parts[iT];
+    if (RegExp(r'\\p[1-9]').hasMatch(text)) continue;
+    text = text.replaceAll(RegExp(r'\{[^}]*\}'), '').replaceAll('\\N', '\n').replaceAll('\\n', '\n').replaceAll('\\h', ' ');
+    text = text.split('\n').map((e) => e.trim()).where((e) => e.isNotEmpty).join('\n');
+    if (text.isNotEmpty) cues.add(Cue(st, en, text));
+  }
+  cues.sort((a, b) => a.start.compareTo(b.start));
+  return cues;
+}
+
+/// Baca subtitle referensi: otomatis mengenali ASS/SSA atau SRT.
+List<Cue> parseReference(String src) {
+  if (src.contains('[Events]') || RegExp(r'^\s*Dialogue:', multiLine: true).hasMatch(src)) return parseAssFile(src);
+  return parseSrtFile(src);
+}
+
 /// SRT. Hanya kelas "kemungkinan subtitle" dan yang sudah diterima pengguna; `includeDoubtful` menambah yang meragukan.
 String buildSrt(List<Sub> subs, {bool includeDoubtful = false}) {
   final sorted = [...subs]..sort((a, b) {
@@ -867,44 +927,180 @@ String _assTime(double t) {
 
 String _assEscape(String t) => t.replaceAll('\\', '/').replaceAll('{', '(').replaceAll('}', ')').replaceAll('\r', '').replaceAll('\n', '\\N');
 
-/// ASS dengan posisi per subtitle (\an2\pos) dan gaya terpisah per area. Resolusi acuan = ukuran video.
-String buildAss(List<Sub> subs, {required int width, required int height, Map<int, String>? areaNames, bool includeDoubtful = false}) {
+/// Lajur posisi: 0 atas, 1 tengah, 2 bawah (dari kotak subtitle).
+int assLane(Sub s) {
+  final bx = s.box;
+  if (bx == null || bx.length != 4) return 2;
+  final cy = (bx[1] + bx[3]) / 2;
+  return cy < 0.33 ? 0 : (cy < 0.66 ? 1 : 2);
+}
+
+double _medianOf(List<double> v, double def) {
+  if (v.isEmpty) return def;
+  final s = [...v]..sort();
+  return s[s.length ~/ 2];
+}
+
+/// ASS dengan UKURAN HURUF TETAP dan posisi tetap per lajur (atas / tengah / bawah): tanpa \pos per baris,
+/// jadi semua subtitle di lajur yang sama persis sama. `fontPx` null = ukuran otomatis (median tinggi huruf video).
+String buildAss(List<Sub> subs, {required int width, required int height, bool includeDoubtful = false, double? fontPx}) {
   final w = width > 0 ? width : 1280;
   final h = height > 0 ? height : 720;
   final list = subs.where((s) => s.exportable || (includeDoubtful && s.cls == clsDoubt && s.text.trim().isNotEmpty)).toList()
     ..sort((a, b) => a.start.compareTo(b.start));
-  final areas = <int>{for (final s in list) s.area}.toList()..sort();
+  // ukuran huruf: median dari semua subtitle (stabil terhadap kotak yang kurang tepat)
+  final sizes = <double>[];
+  for (final s in list) {
+    final bx = s.box;
+    if (bx != null && bx.length == 4) {
+      final lines = math.max(1, s.text.trim().split('\n').length);
+      sizes.add((bx[3] - bx[1]) * h / lines * 0.8);
+    }
+  }
+  final fs = (fontPx ?? math.max(h * 0.035, math.min(h * 0.075, _medianOf(sizes, h * 0.055)))).round();
+  // margin per lajur: median jarak ke tepi layar
+  final marg = <int, List<double>>{0: <double>[], 1: <double>[], 2: <double>[]};
+  for (final s in list) {
+    final bx = s.box;
+    if (bx == null || bx.length != 4) continue;
+    final ln = assLane(s);
+    if (ln == 0) marg[0]!.add(bx[1] * h);
+    if (ln == 2) marg[2]!.add((1 - bx[3]) * h);
+  }
+  final used = <int>{for (final s in list) assLane(s)}.toList()..sort();
+  if (used.isEmpty) used.add(2);
+  const names = ['Atas', 'Tengah', 'Bawah'];
+  const aligns = [8, 5, 2];
   final b = StringBuffer();
   b.write('[Script Info]\r\nTitle: Hardsub OCR\r\nScriptType: v4.00+\r\nWrapStyle: 2\r\nScaledBorderAndShadow: yes\r\n');
   b.write('PlayResX: $w\r\nPlayResY: $h\r\n\r\n');
   b.write('[V4+ Styles]\r\n');
   b.write('Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, '
       'ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\r\n');
-  final fs = math.max(16, (h * 0.055).round());
-  if (areas.isEmpty) areas.add(0);
-  for (final a in areas) {
-    final nm = (areaNames != null && areaNames[a] != null) ? areaNames[a]! : 'Area${a + 1}';
-    b.write('Style: ${_styleName(nm, a)},Arial,$fs,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,2,0,2,20,20,${(h * 0.04).round()},1\r\n');
+  for (final ln in used) {
+    final mv = ln == 1 ? 0 : math.max(0, math.min((h * 0.4).round(), _medianOf(marg[ln]!, h * 0.04).round()));
+    b.write('Style: ${names[ln]},Arial,$fs,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,2,0,${aligns[ln]},20,20,$mv,1\r\n');
   }
   b.write('\r\n[Events]\r\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\r\n');
   for (final s in list) {
-    final nm = (areaNames != null && areaNames[s.area] != null) ? areaNames[s.area]! : 'Area${s.area + 1}';
-    var tag = '';
-    final bx = s.box;
-    if (bx != null && bx.length == 4) {
-      final x = ((bx[0] + bx[2]) / 2 * w).round();
-      final y = (bx[3] * h).round();
-      final lines = math.max(1, s.text.trim().split('\n').length);
-      final lh = (bx[3] - bx[1]) * h / lines;
-      final size = math.max(12, (lh * 0.8).round());
-      tag = '{\\an2\\pos($x,$y)\\fs$size}';
-    }
-    b.write('Dialogue: ${s.area},${_assTime(s.start)},${_assTime(s.end)},${_styleName(nm, s.area)},,0,0,0,,$tag${_assEscape(s.text.trim())}\r\n');
+    b.write('Dialogue: ${s.area},${_assTime(s.start)},${_assTime(s.end)},${names[assLane(s)]},,0,0,0,,${_assEscape(s.text.trim())}\r\n');
   }
   return b.toString();
 }
 
-String _styleName(String nm, int a) => nm.replaceAll(RegExp(r'[^A-Za-z0-9_]'), '').isEmpty ? 'Area${a + 1}' : nm.replaceAll(RegExp(r'[^A-Za-z0-9_]'), '');
+// ----------------------- watermark & tulisan menempel -----------------------
+final RegExp _domainRe = RegExp(r'(?:www\.)?[A-Za-z0-9-]{5,}\.[a-z]{2,4}\b');
+
+class Stripped {
+  final String text;
+  final double cutL; // porsi lebar yang dibuang di kiri
+  final double cutR; // porsi lebar yang dibuang di kanan
+  Stripped(this.text, this.cutL, this.cutR);
+}
+
+/// Buang alamat web (mis. "rajanime.com", termasuk salah baca "rajanime.cet") dari satu baris.
+Stripped stripDomains(String text) {
+  if (!_domainRe.hasMatch(text)) return Stripped(text, 0, 0);
+  final total = math.max(1, text.length);
+  final ms = _domainRe.allMatches(text).toList();
+  var cutL = 0.0, cutR = 0.0;
+  for (final m in ms) {
+    if (m.start <= 1) cutL += (m.end - m.start) / total;
+    if (m.end >= text.length - 1) cutR += (m.end - m.start) / total;
+  }
+  final out = text.replaceAll(_domainRe, ' ').replaceAll(RegExp(r'\s+'), ' ').trim();
+  return Stripped(out, cutL, cutR);
+}
+
+bool _plainLower(String t) => RegExp(r'^[a-z]+$').hasMatch(t);
+
+/// Hapus watermark dari semua sampel (mengubah in place): (1) pola alamat web, (2) token tak-biasa
+/// (HURUF BESAR / berangka / bertitik) yang selalu menempel di ujung baris pada banyak kalimat berbeda.
+/// Kata biasa (huruf kecil) tidak pernah dihapus oleh langkah (2). Mengembalikan jumlah baris yang diubah.
+int stripOverlays(List<Sample> samples) {
+  var changed = 0;
+  void shrink(Cand c, double cutL, double cutR) {
+    final w = c.w;
+    c.l += w * cutL;
+    c.r -= w * cutR;
+  }
+
+  // (1) alamat web
+  for (final s in samples) {
+    final keep = <Cand>[];
+    for (final c in s.cands) {
+      final st = stripDomains(c.text);
+      if (st.text != c.text) {
+        changed++;
+        c.text = st.text;
+        shrink(c, st.cutL, st.cutR);
+      }
+      if (letterCount(c.text) >= 1) keep.add(c);
+    }
+    if (keep.length != s.cands.length) s.cands = keep;
+  }
+  // (2) token tak-biasa yang selalu di ujung baris
+  final occ = <String, int>{};
+  final edge = <String, int>{};
+  final lines = <String, Set<String>>{};
+  final seenLine = <String>{};
+  for (final s in samples) {
+    for (final c in s.cands) {
+      final full = norm(c.text);
+      if (!seenLine.add(full)) continue; // tiap teks baris unik dihitung sekali
+      final toks = c.text.split(' ').where((e) => e.isNotEmpty).toList();
+      for (var i = 0; i < toks.length; i++) {
+        final n = norm(toks[i]);
+        if (n.length < 4) continue;
+        occ[n] = (occ[n] ?? 0) + 1;
+        if (i == 0 || i == toks.length - 1) edge[n] = (edge[n] ?? 0) + 1;
+        lines.putIfAbsent(n, () => <String>{}).add(full);
+      }
+    }
+  }
+  final bad = <String>{};
+  for (final n in occ.keys) {
+    final o = occ[n]!;
+    if (o < 8 || (edge[n] ?? 0) / o < 0.85) continue;
+    bad.add(n);
+  }
+  if (bad.isEmpty) return changed;
+  bool isBadTok(String t) {
+    final n = norm(t);
+    if (!bad.contains(n)) return false;
+    final letters = t.replaceAll(RegExp(r'[^A-Za-z]'), '');
+    final unusual = !_plainLower(letters) || RegExp(r'[0-9.@]').hasMatch(t);
+    return unusual && (letters.toUpperCase() == letters || RegExp(r'[0-9.@]').hasMatch(t));
+  }
+
+  for (final s in samples) {
+    final keep = <Cand>[];
+    for (final c in s.cands) {
+      final toks = c.text.split(' ').where((e) => e.isNotEmpty).toList();
+      if (toks.isNotEmpty && (isBadTok(toks.first) || isBadTok(toks.last)) && toks.length > 1) {
+        final total = math.max(1, c.text.length);
+        var cutL = 0.0, cutR = 0.0;
+        if (isBadTok(toks.last)) {
+          cutR = toks.last.length / total;
+          toks.removeLast();
+        }
+        if (toks.isNotEmpty && isBadTok(toks.first)) {
+          cutL = toks.first.length / total;
+          toks.removeAt(0);
+        }
+        c.text = toks.join(' ');
+        shrink(c, cutL, cutR);
+        changed++;
+      } else if (toks.length == 1 && isBadTok(toks.first)) {
+        changed++;
+        continue; // baris yang hanya berisi watermark
+      }
+      if (letterCount(c.text) >= 1) keep.add(c);
+    }
+    if (keep.length != s.cands.length) s.cands = keep;
+  }
+  return changed;
+}
 
 // ----------------------- pencocokan dengan subtitle referensi -----------------------
 class OffsetInfo {
