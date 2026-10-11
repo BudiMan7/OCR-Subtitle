@@ -6,9 +6,6 @@ cp main.dart lib/main.dart
 
 if [ -f android/app/build.gradle.kts ]; then
   GRADLE=android/app/build.gradle.kts
-
-if [ -f android/app/build.gradle.kts ]; then
-  GRADLE=android/app/build.gradle.kts
   KTS=1
 else
   GRADLE=android/app/build.gradle
