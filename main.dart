@@ -246,9 +246,14 @@ bool similar(String a, String b) {
 class Sample {
   double t;
   String text;
-  Sample(this.t, this.text);
-  Map<String, dynamic> toJson() => {'t': t, 'text': text};
-  factory Sample.fromJson(Map<String, dynamic> j) => Sample((j['t'] as num).toDouble(), j['text'] as String);
+  int zone;
+  Sample(this.t, this.text, [this.zone = 0]);
+  Map<String, dynamic> toJson() => {'t': t, 'text': text, 'z': zone};
+  factory Sample.fromJson(Map<String, dynamic> j) => Sample(
+        (j['t'] as num).toDouble(),
+        j['text'] as String,
+        (j['z'] as num?)?.toInt() ?? 0,
+      );
 }
 
 class Sub {
