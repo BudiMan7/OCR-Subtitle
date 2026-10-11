@@ -20,7 +20,7 @@ const double kMaxDropoutSec = 0.6;
 const double kMinDuration = 0.7;
 const int kSaveEvery = 100;
 
-/// Watermark yang selalu muncul. Bandingkan secara fuzzy (bukan exact match).
+/// Watermark yang selalu muncul. Dibandingkan secara fuzzy (bukan exact match).
 const List<String> kWatermarkKeys = [
   'rajanime',
   'rajanimecom',
@@ -125,6 +125,9 @@ String cleanText(String t, int mode) {
 bool looksLikeWatermark(String text) {
   final n = text.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '');
   if (n.length < 4) return false;
+  if (RegExp(r'[a-z0-9]{3,}\.(?:com|net|tv|org|xyz|info|biz|co)', caseSensitive: false).hasMatch(text)) {
+    return true;
+  }
   for (final k in kWatermarkKeys) {
     if (n.contains(k)) return true;
     final win = k.length;
@@ -141,6 +144,21 @@ bool looksLikeWatermark(String text) {
     if (best >= 0.80) return true;
   }
   return false;
+}
+
+/// Potong watermark yang menempel di dalam baris.
+/// Contoh: "selamat kepadamuime.com" -> "selamat kepadamu"
+String stripWatermark(String text) {
+  var s = text;
+  s = s.replaceAll(
+    RegExp(r'\b[a-z0-9@\-]{3,}\.(?:com|net|tv|org|xyz|info|biz|co)\b', caseSensitive: false),
+    ' ',
+  );
+  s = s.replaceAll(
+    RegExp(r'[a-z]{3,}(?:com|net|tv|org|xyz)\b', caseSensitive: false),
+    ' ',
+  );
+  return s.replaceAll(RegExp(r'\s+'), ' ').trim();
 }
 
 List<Sub> dropWatermarks(List<Sub> subs, double videoDurationSec, {double frac = 0.7}) {
@@ -194,7 +212,7 @@ bool similar(String a, String b) {
 class Sample {
   double t;
   String text;
-  int zone; // 0 = zona atas, 1 = zona bawah, dst.
+  int zone;
   Sample(this.t, this.text, [this.zone = 0]);
   Map<String, dynamic> toJson() => {'t': t, 'text': text, 'z': zone};
   factory Sample.fromJson(Map<String, dynamic> j) => Sample(
@@ -257,35 +275,7 @@ class _Ln {
   _Ln(this.text, this.box);
 }
 
-/// Kelompokkan baris OCR jadi beberapa zona berdasarkan jarak vertikal.
-/// Zona 0 = paling atas, zona berikutnya makin ke bawah.
-List<List<_Ln>> _clusterLines(List<_Ln> lines, double imgH) {
-  if (lines.isEmpty) return [];
-  if (lines.length == 1) return [lines];
-  final hs = lines.map((l) => l.box.height).toList()..sort();
-  final medH = hs[hs.length ~/ 2];
-  final gs = <double>[];
-  for (var i = 1; i < lines.length; i++) {
-    gs.add(lines[i].box.top - lines[i - 1].box.bottom);
-  }
-  gs.sort();
-  final medG = gs.isEmpty ? 0 : gs[gs.length ~/ 2];
-  final threshold = math.max(medH * 1.2, medG * 3);
-  final out = <List<_Ln>>[];
-  var cur = <_Ln>[lines.first];
-  for (var i = 1; i < lines.length; i++) {
-    if (lines[i].box.top - lines[i - 1].box.bottom > threshold) {
-      out.add(cur);
-      cur = [];
-    }
-    cur.add(lines[i]);
-  }
-  out.add(cur);
-  return out;
-}
-
 // ----------------------- penggabungan sampel -> subtitle -----------------------
-/// Satu zona: gabungkan sampel jadi subtitle.
 List<Sub> _mergeOneZone(List<Sample> samples, double interval, int zone) {
   const eps = 1e-6;
   final groups = <_G>[];
@@ -387,7 +377,6 @@ List<Sub> _mergeOneZone(List<Sample> samples, double interval, int zone) {
   return subs;
 }
 
-/// Semua zona: merge terpisah, gabung, lalu perbaiki overlap.
 List<Sub> mergeSamples(List<Sample> samples, double interval) {
   final byZone = <int, List<Sample>>{};
   for (final s in samples) {
@@ -401,7 +390,6 @@ List<Sub> mergeSamples(List<Sample> samples, double interval) {
     final c = a.start.compareTo(b.start);
     return c != 0 ? c : a.zone.compareTo(b.zone);
   });
-  // hindari entry yang saling menimpa di zona yang sama
   for (var i = 0; i + 1 < all.length; i++) {
     if (all[i].zone == all[i + 1].zone && all[i].end > all[i + 1].start) {
       all[i].end = math.max(all[i].start + 0.1, all[i + 1].start - 0.001);
@@ -465,10 +453,6 @@ List<String> _wrapText(String text, int maxChars, int maxLines) {
   return out.take(maxLines).toList();
 }
 
-/// Bangun file ASS. Setiap [Sub] punya [zone]:
-///   zone 0 = subtitle atas (\an8)
-///   zone 1 = subtitle bawah (\an2)
-///   zone 2+ = makin naik dari bawah (pakai Label)
 String buildAss(List<Sub> subs, int vw, int vh, {int fontSize = 48}) {
   final sorted = [...subs]..sort((a, b) {
       final c = a.start.compareTo(b.start);
@@ -522,7 +506,7 @@ String buildAss(List<Sub> subs, int vw, int vh, {int fontSize = 48}) {
   return b.toString();
 }
 
-// ----------------------- koreksi otomatis -----------------------
+// ----------------------- koreksi otomatis (frekuensi) -----------------------
 final RegExp _wordRe = RegExp(r'[A-Za-z0-9]+');
 
 String _canon(String w) {
@@ -607,6 +591,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
 
   RangeValues yR = const RangeValues(0.72, 0.92);
   RangeValues xR = const RangeValues(0.05, 0.95);
+  double zoneSplit = 0.5; // garis pemisah zona atas/bawah (0..1)
   int script = 0;
   bool autoPos = false;
   bool strictLatin = true;
@@ -672,6 +657,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     final j = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
     yR = RangeValues(_d(j['y0'], yR.start), _d(j['y1'], yR.end));
     xR = RangeValues(_d(j['x0'], xR.start), _d(j['x1'], xR.end));
+    zoneSplit = _d(j['zoneSplit'], zoneSplit).clamp(0.05, 0.95).toDouble();
     script = (j['script'] is int) ? (j['script'] as int).clamp(0, 2).toInt() : script;
     autoPos = j['autoPos'] is bool ? j['autoPos'] as bool : autoPos;
     strictLatin = j['strictLatin'] is bool ? j['strictLatin'] as bool : strictLatin;
@@ -693,6 +679,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         'y1': yR.end,
         'x0': xR.start,
         'x1': xR.end,
+        'zoneSplit': zoneSplit,
         'script': script,
         'autoPos': autoPos,
         'strictLatin': strictLatin,
@@ -788,9 +775,9 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     return area <= 0 ? 0 : (i.width * i.height) / area;
   }
 
-  /// OCR satu file. Mengembalikan list teks, satu untuk tiap zona
-  /// (0 = atas, 1 = bawah, dst.).
-  Future<List<String>> _ocrFile(String path, double imgH) async {
+  /// OCR satu file untuk satu zona (0 = atas, 1 = bawah).
+  /// Pemilihan baris memakai `zoneSplit` (0..1).
+  Future<String> _ocrFile(String path, double imgH, int zone) async {
     final input = InputImage.fromFilePath(path);
     final lines = <_Ln>[];
     if (script == 0) {
@@ -820,8 +807,13 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         }
       }
     }
+
+    // filter: hanya baris di zona ini
     final kept = <_Ln>[];
     for (final ln in lines) {
+      final cy = ln.box.center.dy / imgH;
+      final inZone = zone == 0 ? (cy < zoneSplit) : (cy >= zoneSplit);
+      if (!inZone) continue;
       if (autoPos) {
         final ratio = ln.box.height / imgH;
         if (ratio < 0.025 || ratio > 0.12) continue;
@@ -830,23 +822,23 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       kept.add(ln);
     }
     kept.sort((a, b) => a.box.top.compareTo(b.box.top));
-    final zones = _clusterLines(kept, imgH);
-    return zones
-        .map((z) => cleanText(z.map((l) => l.text).join('\n'), script))
-        .map((t) => t.split('\n').where((l) => l.trim().isNotEmpty && !looksLikeWatermark(l)).join('\n'))
-        .map((t) => letterCount(t) >= 2 ? t : '')
-        .toList();
+    final raw = cleanText(kept.map((l) => l.text).join('\n'), script);
+    return raw
+        .split('\n')
+        .map((l) => stripWatermark(l))
+        .where((l) => l.trim().isNotEmpty && !looksLikeWatermark(l))
+        .join('\n');
   }
 
-  Future<List<String>> _ocrBest(String rawPath, int cw, int ch) async {
-    var best = await _ocrFile(rawPath, ch.toDouble());
-    final lt = best.fold<int>(0, (s, t) => s + letterCount(t));
+  Future<String> _ocrBest(String rawPath, int cw, int ch, int zone) async {
+    var best = await _ocrFile(rawPath, ch.toDouble(), zone);
+    final lt = letterCount(best);
     if (lt >= 6) return best;
     final binPath = await _ch.invokeMethod<String>('binarize');
     if (binPath != null) {
       final binH = ch * (cw > 900 ? 1 : 2) + 20;
-      final alt = await _ocrFile(binPath, binH.toDouble());
-      if (alt.fold<int>(0, (s, t) => s + letterCount(t)) > lt) best = alt;
+      final alt = await _ocrFile(binPath, binH.toDouble(), zone);
+      if (letterCount(alt) > lt) best = alt;
     }
     return best;
   }
@@ -872,13 +864,21 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       if (g == null || g['ok'] != true) throw Exception('frame tidak terbaca');
       final path = g['path'] as String?;
       final frac = (g['frac'] as num).toDouble();
-      final txts = path == null ? <String>[] : await _ocrBest(path, (g['cw'] as num).toInt(), (g['ch'] as num).toInt());
+      final cw = (g['cw'] as num).toInt();
+      final ch = (g['ch'] as num).toInt();
       final warn = frac < (autoPos ? kMinTextFrac * 0.3 : kMinTextFrac)
           ? '(Teks terang tidak terdeteksi. Cek waktu, area, atau turunkan ambang kecerahan.)\n'
           : '';
-      final joined = txts.isEmpty
-          ? '(kosong)'
-          : txts.asMap().entries.map((e) => '[zona ${e.key}]\n${e.value.isEmpty ? "(kosong)" : e.value}').join('\n---\n');
+      if (path == null) {
+        setState(() => testResult = '${warn}(kosong)');
+        return;
+      }
+      final top = await _ocrBest(path, cw, ch, 0);
+      final bot = await _ocrBest(path, cw, ch, 1);
+      final joined = [
+        '[zona 0]\n${top.isEmpty ? "(kosong)" : top}',
+        '[zona 1]\n${bot.isEmpty ? "(kosong)" : bot}',
+      ].join('\n---\n');
       setState(() => testResult = warn + joined);
     } catch (e) {
       setState(() => testResult = 'Error: $e');
@@ -887,7 +887,8 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
 
   String _sig(int s, int e, int step) =>
       '$uri|$s|$e|$step|${_effX.start.toStringAsFixed(2)},${_effX.end.toStringAsFixed(2)},'
-      '${_effY.start.toStringAsFixed(2)},${_effY.end.toStringAsFixed(2)}|$light|${bright.round()}|$adaptive|$script|$autoPos|$strictLatin';
+      '${_effY.start.toStringAsFixed(2)},${_effY.end.toStringAsFixed(2)}|$zoneSplit|'
+      '$light|${bright.round()}|$adaptive|$script|$autoPos|$strictLatin';
 
   Future<void> clearTemp() async {
     try {
@@ -931,7 +932,6 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       } catch (_) {}
     }
 
-    // Resume: hitung frame terakhir yang sudah diproses dari daftar Sample.
     int resumedFrames = 0;
     if (list.isNotEmpty) {
       var maxT = 0.0;
@@ -954,15 +954,11 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     } catch (_) {}
     await _ch.invokeMethod('resetPrev');
     final t0 = DateTime.now();
-    var lastGrabTexts = <String>[];
-    // ambil teks frame terakhir yang sudah diproses (untuk adaptive mode)
+    var lastGrabTexts = <String>['', ''];
     if (resumedFrames > 0) {
       final lastT = (startMs + (resumedFrames - 1) * step) / 1000.0;
       for (final s in list) {
-        if ((s.t - lastT).abs() < 1e-6) {
-          while (lastGrabTexts.length <= s.zone) {
-            lastGrabTexts.add('');
-          }
+        if ((s.t - lastT).abs() < 1e-6 && s.zone < lastGrabTexts.length) {
           lastGrabTexts[s.zone] = s.text;
         }
       }
@@ -972,7 +968,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
 
     Future<List<String>> sampleAt(int n) async {
       final tMs = startMs + n * step;
-      var texts = <String>[];
+      var texts = <String>['', ''];
       try {
         final g = await _ch.invokeMapMethod<String, dynamic>('grab', _grabArgs(tMs));
         if (g == null || g['ok'] != true) {
@@ -982,11 +978,16 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
           final changed = (g['changed'] as num).toDouble();
           final path = g['path'] as String?;
           if (frac < (autoPos ? kMinTextFrac * 0.3 : kMinTextFrac)) {
-            texts = [];
+            texts = ['', ''];
           } else if (changed >= 0 && changed < kChangeFrac) {
             texts = lastGrabTexts;
           } else if (path != null) {
-            texts = await _ocrBest(path, (g['cw'] as num).toInt(), (g['ch'] as num).toInt());
+            final cw = (g['cw'] as num).toInt();
+            final ch = (g['ch'] as num).toInt();
+            texts = [
+              await _ocrBest(path, cw, ch, 0),
+              await _ocrBest(path, cw, ch, 1),
+            ];
           }
         }
         failStreak = 0;
@@ -1129,7 +1130,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
           title: Text('${ext.toUpperCase()} tersimpan'),
           content: Text(
             '$where\n\n'
-            '${isAss ? "Format ASS: dialog di atas & label di bawah (sesuai posisi yang dideteksi). Aktifkan HW+ / SW decoder di MX Player." : "Format SRT: teks polos, semua di bawah."}\n\n'
+            '${isAss ? "Format ASS: zona atas di atas, zona bawah di bawah. Aktifkan HW+ / SW decoder di MX Player." : "Format SRT: teks polos, semua di bawah."}\n\n'
             'Di MX Player: menu subtitle → Buka → pilih file ini dari folder Download.'
             '${testMode ? '\n\nIni hasil UJI. Matikan "Mode uji" di tab Siapkan untuk memproses seluruh video.' : ''}',
           ),
@@ -1250,7 +1251,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
             TextButton(
               onPressed: () {
                 final i = subs.indexOf(s);
-                if (i >= 0 && i + 1 < subs.length) {
+                if (i >= 0 && i + 1 < subs.length && subs[i + 1].zone == s.zone) {
                   final n = subs.removeAt(i + 1);
                   s.text = '${s.text}\n${n.text}';
                   s.end = n.end;
@@ -1264,7 +1265,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
             ),
             TextButton(
               onPressed: () {
-                final ns = Sub(s.end + 0.05, s.end + 2.05, '(ketik teks)', []);
+                final ns = Sub(s.end + 0.05, s.end + 2.05, '(ketik teks)', [], zone: s.zone);
                 subs.insert(subs.indexOf(s) + 1, ns);
                 setState(() {});
                 saveSubs();
@@ -1295,7 +1296,10 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
                   s.end = en;
                   s.text = ct.text.split('\n').map((e) => e.trim()).where((e) => e.isNotEmpty).join('\n');
                   s.warn = [];
-                  subs.sort((a, b) => a.start.compareTo(b.start));
+                  subs.sort((a, b) {
+                    final c = a.start.compareTo(b.start);
+                    return c != 0 ? c : a.zone.compareTo(b.zone);
+                  });
                   setState(() {});
                   saveSubs();
                   Navigator.pop(c);
@@ -1373,7 +1377,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
               aspectRatio: previewAspect,
               child: Stack(fit: StackFit.expand, children: [
                 Image.memory(previewBytes!, fit: BoxFit.fill, gaplessPlayback: true),
-                CustomPaint(painter: _CropPainter(_effX, _effY)),
+                CustomPaint(painter: _CropPainter(_effX, _effY, zoneSplit)),
               ]),
             ),
           const SizedBox(height: 8),
@@ -1406,6 +1410,18 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
             RangeSlider(values: xR, min: 0, max: 1, onChanged: (v) => setState(() => xR = v), onChangeEnd: (_) => _persist()),
             const Text('Kotak merah harus menutupi subtitle saja (tanpa tulisan lain).', style: TextStyle(fontSize: 12)),
           ],
+          const SizedBox(height: 8),
+          Text('Garis pemisah zona atas/bawah: ${_pct(zoneSplit)}'),
+          Slider(
+            value: zoneSplit,
+            min: 0.05,
+            max: 0.95,
+            divisions: 18,
+            label: _pct(zoneSplit),
+            onChanged: (v) => setState(() => zoneSplit = v),
+            onChangeEnd: (_) => _persist(),
+          ),
+          const Text('Baris di ATAS garis → zona 0 (ditampilkan di atas). Baris di BAWAH → zona 1 (di bawah).', style: TextStyle(fontSize: 12)),
         ]),
         _card('4. Jenis tulisan subtitle', [
           SegmentedButton<int>(
@@ -1496,6 +1512,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
                 'Mode: ${testMode ? 'UJI 60 detik' : 'PENUH'}\n'
                 'Tulisan: $scriptName\n'
                 'Area: $area\n'
+                'Pemisah zona: ${_pct(zoneSplit)}\n'
                 'Interval: $interval dtk${adaptive ? ' (cepat adaptif)' : ''}'),
       ]),
       Row(children: [
@@ -1521,7 +1538,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         const Text(
           '• Boleh ditinggal: tekan Home atau kunci layar, proses tetap jalan (ada notifikasi progres).\n'
           '• Jangan geser/tutup app dari daftar aplikasi terbaru. Jika terlanjur, buka lagi lalu tekan Mulai: proses melanjutkan dari hasil tersimpan.\n'
-          '• Zona atas dan bawah dipisah otomatis. Ekspor ASS menaruh zona atas di atas layar, zona bawah di bawah.',
+          '• Baris di atas garis pemisah ditampilkan sebagai subtitle atas, di bawah garis sebagai subtitle bawah (saat ekspor ASS).',
         ),
       ]),
     ]);
@@ -1588,7 +1605,8 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
 class _CropPainter extends CustomPainter {
   final RangeValues x;
   final RangeValues y;
-  _CropPainter(this.x, this.y);
+  final double split;
+  _CropPainter(this.x, this.y, this.split);
   @override
   void paint(Canvas canvas, Size size) {
     final r = Rect.fromLTRB(x.start * size.width, y.start * size.height, x.end * size.width, y.end * size.height);
@@ -1598,8 +1616,17 @@ class _CropPainter extends CustomPainter {
           ..color = Colors.red
           ..style = PaintingStyle.stroke
           ..strokeWidth = 2);
+    // garis pemisah zona
+    final yLine = split * size.height;
+    canvas.drawLine(
+      Offset(0, yLine),
+      Offset(size.width, yLine),
+      Paint()
+        ..color = Colors.amber
+        ..strokeWidth = 1.5,
+    );
   }
 
   @override
-  bool shouldRepaint(covariant _CropPainter old) => old.x != x || old.y != y;
+  bool shouldRepaint(covariant _CropPainter old) => old.x != x || old.y != y || old.split != split;
 }
