@@ -1,13 +1,24 @@
 package placeholder
 
+import android.Manifest
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
 import android.content.ContentValues
+import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.os.IBinder
+import android.os.PowerManager
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.view.WindowManager
@@ -19,6 +30,74 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.Executors
+
+private const val NOTIF_CHANNEL = "ocr_progress"
+
+private fun ensureChannel(ctx: Context) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (nm.getNotificationChannel(NOTIF_CHANNEL) == null) {
+            nm.createNotificationChannel(
+                NotificationChannel(NOTIF_CHANNEL, "Proses OCR", NotificationManager.IMPORTANCE_LOW)
+            )
+        }
+    }
+}
+
+private fun buildNotif(ctx: Context, text: String, cur: Int, max: Int, ongoing: Boolean): Notification {
+    ensureChannel(ctx)
+    val b = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) Notification.Builder(ctx, NOTIF_CHANNEL)
+    else Notification.Builder(ctx)
+    val launch = ctx.packageManager.getLaunchIntentForPackage(ctx.packageName)
+    if (launch != null) {
+        b.setContentIntent(
+            PendingIntent.getActivity(ctx, 0, launch, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        )
+    }
+    b.setSmallIcon(android.R.drawable.stat_sys_download)
+        .setContentTitle("Hardsub OCR")
+        .setContentText(text)
+        .setOngoing(ongoing)
+    if (ongoing) {
+        b.setProgress(max, cur, max <= 0)
+    } else {
+        b.setAutoCancel(true)
+    }
+    return b.build()
+}
+
+/** Service latar depan: menjaga proses OCR tetap hidup saat app ditinggal. */
+class OcrService : Service() {
+    private var wl: PowerManager.WakeLock? = null
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "hardsub:ocr")
+        wl?.acquire(12 * 60 * 60 * 1000L)
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val text = intent?.getStringExtra("text") ?: "Memproses..."
+        val n = buildNotif(this, text, 0, 0, true)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        } else {
+            startForeground(1, n)
+        }
+        return START_NOT_STICKY
+    }
+
+    override fun onDestroy() {
+        try {
+            wl?.let { if (it.isHeld) it.release() }
+        } catch (_: Throwable) {
+        }
+        super.onDestroy()
+    }
+}
 
 class MainActivity : FlutterActivity() {
     private val channelName = "hardsub/native"
@@ -33,11 +112,28 @@ class MainActivity : FlutterActivity() {
     private var lastH = 0
     private var lastLight = true
     private var lastBright = 200
+    private var vidW = 0
+    private var vidH = 0
+    private var vidRot = 0
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
             .setMethodCallHandler { call, result -> handle(call, result) }
+    }
+
+    // Ambil frame; untuk video besar pakai dekode berskala (lebih hemat memori & lebih cepat)
+    private fun frameAt(r: MediaMetadataRetriever, tUs: Long): Bitmap? {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1 && vidRot == 0 && vidW > 1280 && vidH > 0) {
+            val dw = 1280
+            val dh = (vidH.toLong() * dw / vidW).toInt()
+            try {
+                val b = r.getScaledFrameAtTime(tUs, MediaMetadataRetriever.OPTION_CLOSEST, dw, dh)
+                if (b != null) return b
+            } catch (_: Throwable) {
+            }
+        }
+        return r.getFrameAtTime(tUs, MediaMetadataRetriever.OPTION_CLOSEST)
     }
 
     private fun num(call: MethodCall, key: String): Number = call.argument<Number>(key)!!
@@ -72,6 +168,9 @@ class MainActivity : FlutterActivity() {
                         var h = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
                         val rot = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
                         if (rot == 90 || rot == 270) { val t = w; w = h; h = t }
+                        vidW = w
+                        vidH = h
+                        vidRot = rot
                         var name = "video"
                         var size = 0L
                         contentResolver.query(uri, null, null, null, null)?.use { c ->
@@ -128,7 +227,7 @@ class MainActivity : FlutterActivity() {
                 worker.execute {
                     try {
                         val r = retriever ?: throw IllegalStateException("Video belum dibuka")
-                        val full = r.getFrameAtTime(tMs * 1000, MediaMetadataRetriever.OPTION_CLOSEST)
+                        val full = frameAt(r, tMs * 1000)
                         if (full == null) {
                             ok(result, mapOf("ok" to false))
                             return@execute
@@ -143,26 +242,28 @@ class MainActivity : FlutterActivity() {
                         val px = IntArray(cw * ch)
                         crop.getPixels(px, 0, cw, 0, 0, cw, ch)
                         val gray = ByteArray(cw * ch)
+                        val mask = ByteArray(cw * ch)
                         var cnt = 0
                         for (i in px.indices) {
                             val p = px[i]
                             val lum = (((p shr 16) and 255) * 299 + ((p shr 8) and 255) * 587 + (p and 255) * 114) / 1000
                             gray[i] = lum.toByte()
-                            if (if (light) lum >= bright else lum <= 255 - bright) cnt++
+                            if (if (light) lum >= bright else lum <= 255 - bright) {
+                                cnt++
+                                mask[i] = 1
+                            }
                         }
                         val frac = cnt.toDouble() / px.size
                         var changed = -1.0
                         val pg = prevGray
                         if (pg != null && pg.size == gray.size) {
                             var d = 0
-                            for (i in gray.indices) {
-                                val a = gray[i].toInt() and 255
-                                val b = pg[i].toInt() and 255
-                                if (Math.abs(a - b) > 40) d++
+                            for (i in mask.indices) {
+                                if (mask[i] != pg[i]) d++
                             }
-                            changed = d.toDouble() / gray.size
+                            changed = d.toDouble() / mask.size
                         }
-                        prevGray = gray
+                        prevGray = mask
                         lastGray = gray
                         lastW = cw
                         lastH = ch
@@ -177,7 +278,7 @@ class MainActivity : FlutterActivity() {
                         }
                         if (crop !== full) crop.recycle()
                         full.recycle()
-                        ok(result, mapOf("ok" to true, "frac" to frac, "changed" to changed, "path" to path))
+                        ok(result, mapOf("ok" to true, "frac" to frac, "changed" to changed, "path" to path, "cw" to cw, "ch" to ch))
                     } catch (e: Throwable) {
                         fail(result, "grab", e)
                     }
@@ -187,7 +288,7 @@ class MainActivity : FlutterActivity() {
                 worker.execute {
                     try {
                         val g = lastGray ?: throw IllegalStateException("Belum ada frame")
-                        val scale = 2
+                        val scale = if (lastW > 900) 1 else 2
                         val pad = 10
                         val w2 = lastW * scale + pad * 2
                         val h2 = lastH * scale + pad * 2
@@ -222,6 +323,48 @@ class MainActivity : FlutterActivity() {
                     else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                     result.success(null)
                 }
+            }
+            "serviceStart" -> {
+                val text = call.argument<String>("text") ?: "Memproses..."
+                try {
+                    if (Build.VERSION.SDK_INT >= 33 &&
+                        checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                    ) {
+                        requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 4712)
+                    }
+                    val i = Intent(this, OcrService::class.java).putExtra("text", text)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(i) else startService(i)
+                    result.success(null)
+                } catch (e: Throwable) {
+                    result.error("service", e.message, null)
+                }
+            }
+            "serviceUpdate" -> {
+                val text = call.argument<String>("text") ?: ""
+                val cur = call.argument<Number>("cur")?.toInt() ?: 0
+                val max = call.argument<Number>("max")?.toInt() ?: 0
+                try {
+                    val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                    nm.notify(1, buildNotif(this, text, cur, max, true))
+                } catch (_: Throwable) {
+                }
+                result.success(null)
+            }
+            "serviceStop" -> {
+                try {
+                    stopService(Intent(this, OcrService::class.java))
+                } catch (_: Throwable) {
+                }
+                result.success(null)
+            }
+            "notifyDone" -> {
+                val text = call.argument<String>("text") ?: "Selesai"
+                try {
+                    val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                    nm.notify(2, buildNotif(this, text, 0, 0, false))
+                } catch (_: Throwable) {
+                }
+                result.success(null)
             }
             "dirs" -> result.success(filesDir.absolutePath)
             "save" -> {
