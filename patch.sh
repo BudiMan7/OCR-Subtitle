@@ -4,50 +4,51 @@ set -eu
 mkdir -p lib
 cp main.dart lib/main.dart
 
-# minSdk 24 (dibutuhkan ML Kit)
 if [ -f android/app/build.gradle.kts ]; then
   GRADLE=android/app/build.gradle.kts
+  KTS=1
 else
   GRADLE=android/app/build.gradle
+  KTS=0
 fi
-sed -i 's/flutter\.minSdkVersion/24/' "$GRADLE"
-echo "--- baris minSdk di $GRADLE ---"
-grep -n "minSdk" "$GRADLE" || true
 
-# Matikan R8/minify (R8 gagal dengan ML Kit). APK sedikit lebih besar tapi build aman.
-if [ "$GRADLE" = "android/app/build.gradle.kts" ]; then
+# 1) minSdk 24 (dibutuhkan ML Kit)
+sed -i 's/flutter\.minSdkVersion/24/' "$GRADLE"
+echo "--- minSdk ---"; grep -n "minSdk" "$GRADLE" || true
+
+# 2) Matikan R8/minify (R8 gagal dengan ML Kit)
+if [ "$KTS" = "1" ]; then
   sed -i '/^[[:space:]]*release[[:space:]]*{/a\            isMinifyEnabled = false\n            isShrinkResources = false' "$GRADLE"
 else
   sed -i '/^[[:space:]]*release[[:space:]]*{/a\            minifyEnabled false\n            shrinkResources false' "$GRADLE"
 fi
-echo "--- blok release ---"
-grep -n -A6 "release" "$GRADLE" || true
-if ! grep -qE "isMinifyEnabled = false|minifyEnabled false" "$GRADLE"; then
-  echo "GAGAL mematikan minify"; exit 1
-fi
+grep -qE "isMinifyEnabled = false|minifyEnabled false" "$GRADLE" || { echo "GAGAL mematikan minify"; exit 1; }
 
-# Ganti MainActivity dengan versi kita, pertahankan baris package bawaan
+# 3) Model OCR Jepang (opsional di app, harus ada sebagai dependensi)
+if [ "$KTS" = "1" ]; then
+  printf '\ndependencies {\n    implementation("com.google.mlkit:text-recognition-japanese:16.0.0")\n}\n' >> "$GRADLE"
+else
+  printf "\ndependencies {\n    implementation 'com.google.mlkit:text-recognition-japanese:16.0.0'\n}\n" >> "$GRADLE"
+fi
+echo "--- akhir $GRADLE ---"; tail -8 "$GRADLE"
+
+# 4) MainActivity (+ OcrService) dengan package milik proyek
 KT=$(find android/app/src/main -name MainActivity.kt | head -n1)
 if [ -z "$KT" ]; then
   echo "MainActivity.kt tidak ditemukan"; find android/app/src/main -type f | head -30; exit 1
 fi
 PKG=$(grep -m1 '^package ' "$KT")
+[ -n "$PKG" ] || { echo "GAGAL: package tidak ditemukan"; exit 1; }
+{ echo "$PKG"; tail -n +2 MainActivity.kt; } > "$KT.new"
+mv "$KT.new" "$KT"
+grep -q '"pick" ->' "$KT" || { echo "GAGAL: MainActivity tidak terpasang"; exit 1; }
+grep -q 'class OcrService' "$KT" || { echo "GAGAL: OcrService tidak terpasang"; exit 1; }
 
-if [ -z "$PKG" ]; then
-  echo "GAGAL: package MainActivity tidak ditemukan"
-  exit 1
-fi
-
-# Pasang MainActivity dengan package yang sesuai proyek Flutter.
-sed "s/^package placeholder$/$PKG/" MainActivity.kt > "$KT"
-
-echo "--- Verifikasi MainActivity terpasang ---"
-grep -n "package " "$KT"
-grep -n 'MethodChannel' "$KT"
-grep -n '"pick" ->' "$KT"
-
-if ! grep -q '"pick" ->' "$KT"; then
-  echo "GAGAL: implementasi method pick tidak ditemukan"
-  exit 1
-fi
-
+# 5) Manifest: nama app, izin, dan service latar depan
+MAN=android/app/src/main/AndroidManifest.xml
+sed -i 's/android:label="[^"]*"/android:label="Hardsub OCR"/' "$MAN"
+sed -i 's#<application#<uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>\n    <uses-permission android:name="android.permission.WAKE_LOCK"/>\n    <application#' "$MAN"
+sed -i 's#</application>#    <service android:name=".OcrService" android:exported="false" android:foregroundServiceType="dataSync"/>\n    </application>#' "$MAN"
+grep -q 'OcrService' "$MAN" || { echo "GAGAL: manifest"; exit 1; }
+echo "--- manifest ---"; cat "$MAN"
+echo "patch selesai: $KT ($PKG)"
