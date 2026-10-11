@@ -370,6 +370,7 @@ class MainActivity : FlutterActivity() {
             "save" -> {
                 val name = call.argument<String>("name")!!
                 val text = call.argument<String>("text")!!
+                val mime = call.argument<String>("mime") ?: "application/x-subrip"
                 worker.execute {
                     try {
                         val bytes = text.toByteArray(Charsets.UTF_8)
@@ -377,7 +378,7 @@ class MainActivity : FlutterActivity() {
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                             val cv = ContentValues().apply {
                                 put(MediaStore.Downloads.DISPLAY_NAME, name)
-                                put(MediaStore.Downloads.MIME_TYPE, "application/x-subrip")
+                                put(MediaStore.Downloads.MIME_TYPE, mime)
                                 put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
                             }
                             val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv)
