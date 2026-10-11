@@ -4,6 +4,12 @@ set -eu
 mkdir -p lib
 cp main.dart lib/main.dart
 
+
+if [ -d assets ]; then
+  mkdir -p assets
+  cp -r assets/. assets/
+fi
+
 if [ -f android/app/build.gradle.kts ]; then
   GRADLE=android/app/build.gradle.kts
   KTS=1
