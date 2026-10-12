@@ -356,6 +356,23 @@ void main() {
     expect(samples[13].cands[0].text, 'Kalimat lain 1 dengan kita');
   });
 
+  test('watermark kecil di pojok yang bacanya berubah-ubah dibuang; subtitle atas tetap', () {
+    final samples = <Sample>[];
+    const wm = ['raiante. Cet', 'rajanime.cem', 'rajan1me.com', 'raianime. Com'];
+    for (var i = 0; i < 40; i++) {
+      samples.add(Sample(i * 0.5, [
+        Cand(wm[i % 4], 0.80, 0.02, 0.95, 0.045, outline: 0.3),
+        Cand('Mereka yang tunduk kepada kita diperbolehkan', 0.15, 0.03, 0.85, 0.09, outline: 0.9),
+      ]));
+    }
+    final n = stripOverlays(samples);
+    expect(n, greaterThanOrEqualTo(40));
+    for (final s in samples) {
+      expect(s.cands.length, 1);
+      expect(s.cands[0].text, 'Mereka yang tunduk kepada kita diperbolehkan');
+    }
+  });
+
   test('referensi ASS dibaca (tag, \\N, gambar vektor dilewati) dan dikenali otomatis', () {
     const ass = '[Script Info]\nTitle: x\n\n[V4+ Styles]\nFormat: Name, Fontname\nStyle: Default,Arial\n\n'
         '[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n'
