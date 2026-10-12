@@ -10,6 +10,7 @@ dependencies:
   flutter:
     sdk: flutter
   google_mlkit_text_recognition: '>=0.13.0 <1.0.0'
+  google_mlkit_translation: '>=0.13.0 <1.0.0'
 
 dev_dependencies:
   flutter_test:
