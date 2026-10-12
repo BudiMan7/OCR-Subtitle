@@ -641,6 +641,10 @@ class Sub {
   double pair;
   double bonus; // koreksi skor dari subtitle referensi (+ didukung, - tidak didukung)
   bool accepted;
+  String? refTr; // terjemahan referensi (pembanding)
+  double trCov; // porsi kata OCR yang cocok dengan terjemahan (-1 = tidak ada)
+  String? rawText; // teks sebelum sisa watermark dibuang
+  String? trimText; // teks hasil pembuangan (untuk memastikan tidak menimpa suntingan pengguna)
   Sub(this.start, this.end, this.text, [List<String>? warn])
       : warn = warn ?? <String>[],
         cls = clsLikely,
@@ -649,6 +653,7 @@ class Sub {
         n = 1,
         pair = -1.0,
         bonus = 0.0,
+        trCov = -1.0,
         accepted = false;
 
   double get eff => score + bonus;
@@ -673,6 +678,10 @@ class Sub {
         'pair': pair,
         'bo': bonus,
         'acc': accepted,
+        'rtr': refTr,
+        'tc': trCov,
+        'ot': rawText,
+        'tt': trimText,
       };
 
   factory Sub.fromJson(Map<String, dynamic> j) {
@@ -692,6 +701,10 @@ class Sub {
     s.pair = (j['pair'] as num?)?.toDouble() ?? -1.0;
     s.bonus = (j['bo'] as num?)?.toDouble() ?? 0.0;
     s.accepted = (j['acc'] as bool?) ?? false;
+    s.refTr = j['rtr'] as String?;
+    s.trCov = (j['tc'] as num?)?.toDouble() ?? -1.0;
+    s.rawText = j['ot'] as String?;
+    s.trimText = j['tt'] as String?;
     return s;
   }
 }
@@ -803,7 +816,8 @@ class Cue {
   final double start;
   final double end;
   final String text;
-  Cue(this.start, this.end, this.text);
+  String? tr; // terjemahan Indonesia (mesin, offline) - hanya sebagai saksi pembanding, tidak pernah mengganti teks OCR
+  Cue(this.start, this.end, this.text, [this.tr]);
 }
 
 final RegExp _srtTime = RegExp(r'(\d+):(\d{1,2}):(\d{1,2})[,.](\d{1,3})\s*-->\s*(\d+):(\d{1,2}):(\d{1,2})[,.](\d{1,3})');
@@ -990,6 +1004,29 @@ String buildAss(List<Sub> subs, {required int width, required int height, bool i
 
 // ----------------------- watermark & tulisan menempel -----------------------
 final RegExp _domainRe = RegExp(r'(?:www\.)?[A-Za-z0-9-]{5,}\.[a-z]{2,4}\b');
+// Versi longgar, tapi HANYA untuk nama watermark yang dikenal (salah baca OCR tetap kena: "Jime.cem", "raiante. Cet").
+// Nama sebelum titik harus mirip nama watermark dan harus berada di tepi baris, jadi kalimat biasa tidak tersentuh.
+final List<String> kWatermarkNames = ['rajanime'];
+final RegExp _domainRe2 = RegExp(r'[A-Za-z0-9-]{3,}\.\s?(?:com|cem|cet|cc|corn|con|cam|c0m|ccm)\b', caseSensitive: false);
+
+bool _isMarkName(String n) {
+  final x = n.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '');
+  for (final m in kWatermarkNames) {
+    if (m.contains(x) && x.length >= 4) return true;
+    if (simRatio(x, m) >= 0.45) return true;
+  }
+  return false;
+}
+
+List<RegExpMatch> _markMatches(String text) {
+  final out = <RegExpMatch>[];
+  for (final m in _domainRe2.allMatches(text)) {
+    final name = text.substring(m.start, text.indexOf('.', m.start));
+    final atEdge = m.start <= 1 || m.end >= text.length - 1;
+    if (atEdge && _isMarkName(name)) out.add(m);
+  }
+  return out;
+}
 
 class Stripped {
   final String text;
@@ -1000,19 +1037,31 @@ class Stripped {
 
 /// Buang alamat web (mis. "rajanime.com", termasuk salah baca "rajanime.cet") dari satu baris.
 Stripped stripDomains(String text) {
-  if (!_domainRe.hasMatch(text)) return Stripped(text, 0, 0);
+  final mm = _markMatches(text);
+  if (!_domainRe.hasMatch(text) && mm.isEmpty) return Stripped(text, 0, 0);
   final total = math.max(1, text.length);
-  final ms = _domainRe.allMatches(text).toList();
+  final ms = [..._domainRe.allMatches(text), ...mm];
   var cutL = 0.0, cutR = 0.0;
   for (final m in ms) {
     if (m.start <= 1) cutL += (m.end - m.start) / total;
     if (m.end >= text.length - 1) cutR += (m.end - m.start) / total;
   }
-  final out = text.replaceAll(_domainRe, ' ').replaceAll(RegExp(r'\s+'), ' ').trim();
-  return Stripped(out, cutL, cutR);
+  var out = text.replaceAll(_domainRe, ' ');
+  for (final m in mm.reversed) {
+    out = out.replaceAll(m.group(0)!, ' ');
+  }
+  out = out.replaceAll(RegExp(r'\s+'), ' ').trim();
+  return Stripped(out, math.min(cutL, 0.6), math.min(cutR, 0.6));
 }
 
 bool _plainLower(String t) => RegExp(r'^[a-z]+$').hasMatch(t);
+
+/// Tulisan kecil di sudut layar (watermark/logo stasiun). Subtitle tidak pernah berada di sudut dan sekecil itu.
+bool isCornerMark(Cand c) {
+  final cx = (c.l + c.r) / 2;
+  final cy = (c.t + c.b) / 2;
+  return c.h <= 0.035 && (cx < 0.25 || cx > 0.75) && (cy < 0.12 || cy > 0.9);
+}
 
 /// Buang tulisan kecil yang diam di tepi layar (logo/watermark) dan muncul di sangat banyak sampel,
 /// walau hasil bacanya berubah-ubah ("rajanime.com", "raiante. Cet", ...). Subtitle di tengah layar tidak tersentuh.
@@ -1428,9 +1477,86 @@ void clearReference(List<Sub> subs) {
     s.refEnd = null;
     s.pair = -1.0;
     s.bonus = 0.0;
-    s.warn.removeWhere((w) => const ['split2', 'span2', 'lowpair', 'trunc_ref', 'conflict', 'bigshift', 'noref'].contains(w));
+    if (s.rawText != null && s.trimText == s.text) s.text = s.rawText!;
+    s.rawText = null;
+    s.trimText = null;
+    s.refTr = null;
+    s.trCov = -1.0;
+    s.warn.removeWhere((w) => const ['split2', 'span2', 'lowpair', 'trunc_ref', 'conflict', 'bigshift', 'noref', 'trimmed'].contains(w));
     if (!s.accepted && s.cls != clsMissing) s.cls = classify(s.score);
   }
+}
+
+// ----------------------- saksi terjemahan -----------------------
+List<String> _letterWords(String t) =>
+    RegExp(r'[A-Za-z]+').allMatches(t.toLowerCase()).map((m) => m.group(0)!).where((w) => w.length >= 3).toList();
+
+/// Dua kata dianggap "mirip" bila sama, saling mengandung (imbuhan: makan/memakan), atau beda 1 huruf (kata panjang).
+bool wordsAlike(String a, String b) {
+  if (a == b) return true;
+  final m = math.min(a.length, b.length);
+  if (m < 4) return false;
+  if (a.contains(b) || b.contains(a)) return true;
+  return m >= 5 && lev(a, b) <= 1;
+}
+
+/// Porsi kata OCR yang punya pasangan di terjemahan (-1 bila tidak bisa dinilai). Hanya petunjuk, bukan penilaian makna.
+double trCoverage(String ocr, String tr) {
+  final ow = _letterWords(ocr);
+  final tw = _letterWords(tr);
+  if (ow.isEmpty || tw.isEmpty) return -1.0;
+  var hit = 0;
+  for (final w in ow) {
+    if (tw.any((x) => wordsAlike(w, x))) hit++;
+  }
+  return hit / ow.length;
+}
+
+bool _junkToken(String tk) {
+  if (RegExp(r'^\.|[A-Za-z]\.[A-Za-z]').hasMatch(tk)) return true; // ".co", "raj.co"
+  if (RegExp(r'[A-Za-z][0-9]|[0-9][A-Za-z]').hasMatch(tk)) return true; // campuran huruf-angka
+  final letters = tk.replaceAll(RegExp(r'[^A-Za-z]'), '');
+  if (letters.length >= 2 && !RegExp(r'[AIUEOaiueo]').hasMatch(letters)) return true; // tanpa vokal
+  return false;
+}
+
+/// Buang sisa watermark di ujung baris (token berbentuk sampah yang tidak punya pasangan di terjemahan).
+/// Hanya bila sisa teks jelas didukung terjemahan (>= 50% kata cocok). Mengembalikan null bila tidak ada perubahan.
+String? trimByTranslation(String text, String tr) {
+  final tw = _letterWords(tr);
+  if (tw.isEmpty) return null;
+  bool matched(String tk) {
+    final w = tk.toLowerCase().replaceAll(RegExp(r'[^a-z]'), '');
+    return w.length >= 3 && tw.any((x) => wordsAlike(w, x));
+  }
+
+  var changed = false;
+  final outLines = <String>[];
+  for (final line in text.split('\n')) {
+    final tk = line.split(RegExp(r'\s+')).where((e) => e.isNotEmpty).toList();
+    for (final fromEnd in [true, false]) {
+      var removedDot = false;
+      while (tk.length >= 3) {
+        final i = fromEnd ? tk.length - 1 : 0;
+        final t = tk[i];
+        if (matched(t)) break;
+        final letters = t.replaceAll(RegExp(r'[^A-Za-z]'), '');
+        final bool junk = _junkToken(t);
+        // setelah token sampah dibuang, satu potongan pendek di sebelahnya (mis. "raj" dari "raj .co") ikut dibuang
+        final bool stub = removedDot && letters.length >= 3 && letters.length <= 4;
+        if (!junk && !stub) break;
+        tk.removeAt(i);
+        removedDot = removedDot || (junk && t.contains('.'));
+        changed = true;
+      }
+    }
+    outLines.add(tk.join(' '));
+  }
+  if (!changed) return null;
+  final out = outLines.join('\n');
+  final cov = trCoverage(out, tr);
+  if (cov < 0.5) return null;
+  return out;
 }
 
 class ApplyStats {
@@ -1516,8 +1642,23 @@ ApplyStats applyReference(List<Sub> subs, List<Cue> cues, MatchResult r, {int ti
     } else {
       st.probable++;
     }
+    final trParts = gr.map((k) => cues[k].tr).toList();
+    final String? trTxt = trParts.every((e) => e != null && e.isNotEmpty) ? trParts.join('\n') : null;
     for (final k in go) {
       final s = items[k];
+      if (trTxt != null) {
+        s.refTr = trTxt;
+        if (go.length == 1) {
+          final trimmed = trimByTranslation(s.text, trTxt);
+          if (trimmed != null) {
+            s.rawText ??= s.text;
+            s.text = trimmed;
+            s.trimText = trimmed;
+            s.warn.add('trimmed');
+          }
+        }
+        s.trCov = trCoverage(s.text, trTxt);
+      }
       final lr = norm(s.text).length / math.max(1, norm(s.refText ?? '').length);
       var odd = false;
       if (go.length == 1 && gr.length == 1) {
@@ -1535,6 +1676,8 @@ ApplyStats applyReference(List<Sub> subs, List<Cue> cues, MatchResult r, {int ti
       } else if (ps >= 0.5 && !odd) {
         s.bonus = 0.05;
       }
+      // terjemahan yang banyak cocok menambah keyakinan; kecocokan rendah TIDAK menurunkan apa pun
+      if (s.trCov >= 0.4 && !odd && ps >= 0.5) s.bonus = math.min(0.3, s.bonus + 0.08);
       if (!s.accepted) s.cls = classify(s.eff);
       if (!confident) s.warn.add('lowpair');
       final os = s.origStart;
