@@ -42,6 +42,8 @@ const Map<String, String> kWarn = {
   'bigshift': 'waktu bergeser >1,5 dtk dari hasil OCR',
   'missing': 'ada di referensi, tidak terbaca OCR',
   'recovered': 'hasil baca ulang, mohon dicek',
+  'suggest': 'ada saran koreksi kata (dari terjemahan referensi)',
+  'autofix': 'kata dikoreksi otomatis (pola berulang + terjemahan)',
   'trimmed': 'sisa watermark dibuang (dicocokkan dengan terjemahan referensi)',
 };
 
@@ -483,6 +485,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       return;
     }
     final st = applyReference(list, refCues, r, timeline: refTimeline, covLo: covHi > covLo ? covLo : null, covHi: covHi > covLo ? covHi : null);
+    autoApplySuggestions(list);
     refOffset = info.offset;
     final sign = info.offset >= 0 ? '+' : '';
     refStatus = 'Offset $sign${info.offset.toStringAsFixed(2)} dtk • ${(info.frac * 100).round()}% cocok • '
@@ -1133,6 +1136,18 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     s.warn.removeWhere((w) => w == 'lowconf' || w == 'recovered' || w == 'single' || w == 'noref' || w == 'lowpair');
   }
 
+  Future<void> acceptAllSuggestions() async {
+    var n = 0;
+    for (final s in subs) {
+      for (final g in List<String>.from(s.sugg)) {
+        if (applySuggestion(s, g, manual: true)) n++;
+      }
+    }
+    setState(() {});
+    await saveSubs();
+    _snack('$n kata dikoreksi sesuai saran.');
+  }
+
   Future<void> acceptAllDoubtful() async {
     final list = subs.where((s) => s.cls == clsDoubt && s.text.trim().isNotEmpty).toList();
     if (list.isEmpty) return;
@@ -1350,6 +1365,19 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
                   child: Text('Terjemahan referensi (pembanding saja${s.trCov >= 0 ? ', ${(s.trCov * 100).round()}% kata cocok' : ''}):\n${s.refTr}',
                       style: const TextStyle(fontStyle: FontStyle.italic, color: Colors.blueGrey)),
                 ),
+              if (s.sugg.isNotEmpty)
+                Wrap(spacing: 6, children: [
+                  for (final g in List<String>.from(s.sugg))
+                    ActionChip(
+                      avatar: const Icon(Icons.auto_fix_high, size: 16),
+                      label: Text('Ganti ${g.replaceFirst('>', ' → ')}'),
+                      onPressed: () {
+                        final i = g.indexOf('>');
+                        final re = RegExp('(?<![A-Za-z])${RegExp.escape(g.substring(0, i))}(?![A-Za-z])');
+                        setD(() => ct.text = ct.text.replaceAll(re, g.substring(i + 1)));
+                      },
+                    ),
+                ]),
               if (s.rawText != null && s.rawText != s.text)
                 Text('Teks OCR sebelum dibersihkan: ${s.rawText!.replaceAll('\n', ' / ')}', style: const TextStyle(fontSize: 12)),
               if (s.origStart != null && ((s.origStart! - s.start).abs() > 0.01))
@@ -1454,6 +1482,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
                   s.start = st;
                   s.end = en;
                   s.text = ct.text.split('\n').map((e) => e.trim()).where((e) => e.isNotEmpty).join('\n');
+                  pruneSuggestions(s);
                   if (s.text.isNotEmpty) _accept(s);
                   subs.sort((a, b) => a.start.compareTo(b.start));
                   setState(() {});
@@ -1857,6 +1886,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         child: ListView(scrollDirection: Axis.horizontal, padding: const EdgeInsets.symmetric(horizontal: 8), children: [
           for (final e in <MapEntry<String, VoidCallback?>>[
             MapEntry('Terima semua meragukan', doubt == 0 ? null : acceptAllDoubtful),
+            MapEntry('Terima saran koreksi (${subs.where((s) => s.sugg.isNotEmpty).length})', subs.every((s) => s.sugg.isEmpty) ? null : acceptAllSuggestions),
             MapEntry('Sinkron referensi', refCues.isEmpty || subs.isEmpty ? null : _syncNow),
             MapEntry('Baca ulang terpotong/hilang', (running || uri == null) ? null : recoverBatch),
             MapEntry('Perbaiki otomatis', subs.isEmpty ? null : autoFix),
