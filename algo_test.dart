@@ -333,6 +333,11 @@ void main() {
     expect(st.cutR, greaterThan(0.1));
     expect(stripDomains('Aku tidak tahu.Dia pergi.').text, 'Aku tidak tahu.Dia pergi.');
     expect(stripDomains('rajanime.com').text, '');
+    expect(stripDomains('Bagaimanapun kita harus tetap Waspada. rajaninne. cem').text, 'Bagaimanapun kita harus tetap Waspada.');
+    expect(stripDomains('mewakili staf mu, aku kepadamu Jime.cem').text, 'mewakili staf mu, aku kepadamu');
+    expect(stripDomains('raiante. Cet Mereka pergi').text, 'Mereka pergi');
+    expect(stripDomains('Mereka pergi. Cet').text, 'Mereka pergi. Cet');
+    expect(stripDomains('Aku suka kopi. Com').text, 'Aku suka kopi. Com');
     final samples = [
       Sample(1, [Cand('Kita pergi sekarang rajanime.com', 0.1, 0.1, 0.9, 0.15)]),
       Sample(2, [Cand('rajanime.com', 0.4, 0.05, 0.6, 0.08)]),
@@ -373,6 +378,12 @@ void main() {
     }
   });
 
+  test('tulisan kecil di sudut = watermark; subtitle di atas/bawah tengah bukan', () {
+    expect(isCornerMark(Cand('rajanie. cc', 0.80, 0.02, 0.95, 0.045)), isTrue);
+    expect(isCornerMark(Cand('Mereka yang tunduk kepada kita', 0.15, 0.03, 0.85, 0.09)), isFalse);
+    expect(isCornerMark(Cand('Menteri Peralatan Perang', 0.30, 0.85, 0.70, 0.89)), isFalse);
+  });
+
   test('referensi ASS dibaca (tag, \\N, gambar vektor dilewati) dan dikenali otomatis', () {
     const ass = '[Script Info]\nTitle: x\n\n[V4+ Styles]\nFormat: Name, Fontname\nStyle: Default,Arial\n\n'
         '[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n'
@@ -398,5 +409,19 @@ void main() {
     expect(back.pair, 0.8);
     final old = Sub.fromJson({'start': 1, 'end': 2, 'text': 'x', 'warn': ['hanya terbaca 1 kali']});
     expect(old.cls, clsLikely);
+  });
+
+  test('terjemahan: sisa watermark dibuang, kalimat lain tidak disentuh', () {
+    expect(trimByTranslation('Mereka memakan raj .co', 'Mereka sedang memakan.'), 'Mereka memakan');
+    expect(trimByTranslation('Aku tidak tahu kenapa ini terjadi', 'Aku tidak tahu kenapa ini terjadi'), isNull);
+    expect(trimByTranslation('Kita harus pergi ke xyz', 'Kita harus pergi sekarang'), 'Kita harus pergi ke');
+    // kalimat beda gaya terjemahan: tidak ada yang dibuang
+    expect(trimByTranslation('Oh begitu maka bagi ras rendahan itu, ini adalah kesempatan bagus',
+        'Begitu, kalau begitu ini kesempatan yang luar biasa bagi ras kalian yang inferior'), isNull);
+  });
+
+  test('terjemahan: cakupan kata hanya petunjuk', () {
+    expect(trCoverage('Mereka memakan nasi', 'Mereka sedang memakan nasi'), 1.0);
+    expect(trCoverage('Aku pergi', ''), -1.0);
   });
 }
