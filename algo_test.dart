@@ -424,4 +424,34 @@ void main() {
     expect(trCoverage('Mereka memakan nasi', 'Mereka sedang memakan nasi'), 1.0);
     expect(trCoverage('Aku pergi', ''), -1.0);
   });
+
+  test('saran koreksi salah-baca dari terjemahan', () {
+    final g = suggestWordFixes('Berita hari ini, di sakaran Radio Yasmato', 'Berita hari ini, di saluran Radio Yamato');
+    expect(g.map((e) => '${e[0]}>${e[1]}').toList(), ['sakaran>saluran', 'Yasmato>Yamato']);
+    // beda pilihan kata (sinonim) bukan salah baca
+    expect(suggestWordFixes('bagi ras rendahan itu', 'bagi ras kalian yang inferior'), isEmpty);
+    // kata benar yang beda imbuhan tidak diubah
+    expect(suggestWordFixes('Mereka memakan nasi', 'Mereka sedang makan nasi'), isEmpty);
+  });
+
+  test('koreksi otomatis hanya untuk pola berulang', () {
+    List<Sub> mk(int n, String txt, String key) {
+      return [
+        for (var i = 0; i < n; i++)
+          Sub(i * 10.0, i * 10.0 + 2, txt)
+            ..sugg = [key]
+            ..warn = ['suggest']
+      ];
+    }
+
+    final subs = mk(3, 'di sakaran Radio', 'sakaran>saluran')..addAll(mk(1, 'itu kepada dia', 'kepada>kepala'));
+    final n = autoApplySuggestions(subs);
+    expect(n, 3);
+    expect(subs.first.text, 'di saluran Radio');
+    expect(subs.last.text, 'itu kepada dia'); // baru sekali: hanya saran
+    expect(subs.last.sugg, ['kepada>kepala']);
+    // sinkron ulang mengembalikan teks OCR asli
+    clearReference(subs);
+    expect(subs.first.text, 'di sakaran Radio');
+  });
 }
