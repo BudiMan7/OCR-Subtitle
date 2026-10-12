@@ -645,6 +645,7 @@ class Sub {
   double trCov; // porsi kata OCR yang cocok dengan terjemahan (-1 = tidak ada)
   String? rawText; // teks sebelum sisa watermark dibuang
   String? trimText; // teks hasil pembuangan (untuk memastikan tidak menimpa suntingan pengguna)
+  List<String> sugg; // saran koreksi kata dari terjemahan, format 'salah>benar'
   Sub(this.start, this.end, this.text, [List<String>? warn])
       : warn = warn ?? <String>[],
         cls = clsLikely,
@@ -654,6 +655,7 @@ class Sub {
         pair = -1.0,
         bonus = 0.0,
         trCov = -1.0,
+        sugg = <String>[],
         accepted = false;
 
   double get eff => score + bonus;
@@ -682,6 +684,7 @@ class Sub {
         'tc': trCov,
         'ot': rawText,
         'tt': trimText,
+        'sg': sugg,
       };
 
   factory Sub.fromJson(Map<String, dynamic> j) {
@@ -705,6 +708,7 @@ class Sub {
     s.trCov = (j['tc'] as num?)?.toDouble() ?? -1.0;
     s.rawText = j['ot'] as String?;
     s.trimText = j['tt'] as String?;
+    s.sugg = (j['sg'] as List?)?.map((e) => e.toString()).toList() ?? <String>[];
     return s;
   }
 }
@@ -1482,7 +1486,8 @@ void clearReference(List<Sub> subs) {
     s.trimText = null;
     s.refTr = null;
     s.trCov = -1.0;
-    s.warn.removeWhere((w) => const ['split2', 'span2', 'lowpair', 'trunc_ref', 'conflict', 'bigshift', 'noref', 'trimmed'].contains(w));
+    s.sugg = <String>[];
+    s.warn.removeWhere((w) => const ['split2', 'span2', 'lowpair', 'trunc_ref', 'conflict', 'bigshift', 'noref', 'trimmed', 'suggest', 'autofix'].contains(w));
     if (!s.accepted && s.cls != clsMissing) s.cls = classify(s.score);
   }
 }
@@ -1557,6 +1562,117 @@ String? trimByTranslation(String text, String tr) {
   final cov = trCoverage(out, tr);
   if (cov < 0.5) return null;
   return out;
+}
+
+/// Saran koreksi salah-baca OCR: kata OCR yang hampir sama (tapi bukan sama persis / bukan imbuhan) dengan kata terjemahan
+/// yang belum punya pasangan. Contoh: OCR "sakaran", terjemahan "saluran". Mengembalikan pasangan [salah, benar].
+List<List<String>> suggestWordFixes(String ocr, String tr) {
+  final re = RegExp(r'[A-Za-z]+');
+  final ot = re.allMatches(ocr).map((m) => m.group(0)!).toList();
+  final tw = re.allMatches(tr).map((m) => m.group(0)!.toLowerCase()).toList();
+  if (ot.isEmpty || tw.isEmpty) return [];
+  bool same(String a, String b) => a == b || (math.min(a.length, b.length) >= 4 && (a.contains(b) || b.contains(a)));
+  final used = <int>{};
+  final okTok = <bool>[];
+  for (final o in ot) {
+    final lw = o.toLowerCase();
+    var ok = false;
+    for (var j = 0; j < tw.length; j++) {
+      if (same(lw, tw[j])) {
+        used.add(j);
+        ok = true;
+      }
+    }
+    okTok.add(ok);
+  }
+  final out = <List<String>>[];
+  for (var i = 0; i < ot.length; i++) {
+    if (okTok[i] || ot[i].length < 5) continue;
+    final lw = ot[i].toLowerCase();
+    var best = -1;
+    var bestD = 99;
+    var tie = false;
+    for (var j = 0; j < tw.length; j++) {
+      if (used.contains(j) || tw[j].length < 5) continue;
+      final d = lev(lw, tw[j]);
+      if (d == 0 || d > 2 || d > 0.34 * math.max(lw.length, tw[j].length)) continue;
+      if (d < bestD) {
+        best = j;
+        bestD = d;
+        tie = false;
+      } else if (d == bestD && tw[j] != tw[best]) {
+        tie = true;
+      }
+    }
+    if (best >= 0 && !tie) out.add([ot[i], matchCase(ot[i], tw[best])]);
+  }
+  return out;
+}
+
+RegExp _wordBound(String w) => RegExp('(?<![A-Za-z])${RegExp.escape(w)}(?![A-Za-z])');
+
+/// Terapkan satu saran ('salah>benar') ke teks subtitle. manual = true: permanen (tidak dibatalkan saat sinkron ulang).
+bool applySuggestion(Sub s, String key, {bool manual = false}) {
+  final i = key.indexOf('>');
+  if (i <= 0) return false;
+  final wrong = key.substring(0, i);
+  final right = key.substring(i + 1);
+  final re = _wordBound(wrong);
+  if (!re.hasMatch(s.text)) {
+    s.sugg.remove(key);
+    return false;
+  }
+  if (manual) {
+    s.rawText = null;
+    s.trimText = null;
+  } else {
+    s.rawText ??= s.text;
+  }
+  s.text = s.text.replaceAll(re, right);
+  if (!manual) s.trimText = s.text;
+  s.sugg.remove(key);
+  s.warn.remove('suggest');
+  if (!manual && !s.warn.contains('autofix')) s.warn.add('autofix');
+  if (s.sugg.isNotEmpty && !s.warn.contains('suggest')) s.warn.add('suggest');
+  return true;
+}
+
+/// Buang saran yang kata salahnya sudah tidak ada di teks (setelah disunting pengguna).
+void pruneSuggestions(Sub s) {
+  s.sugg.removeWhere((g) {
+    final i = g.indexOf('>');
+    return i <= 0 || !_wordBound(g.substring(0, i)).hasMatch(s.text);
+  });
+  if (s.sugg.isEmpty) s.warn.remove('suggest');
+}
+
+/// Pola salah-baca yang berulang (>= 3 subtitle) dan jarang muncul "benar" dikoreksi otomatis; sisanya tetap jadi saran.
+int autoApplySuggestions(List<Sub> subs) {
+  final pairs = <String, List<Sub>>{};
+  final freq = <String, int>{};
+  for (final s in subs) {
+    for (final g in s.sugg) {
+      pairs.putIfAbsent(g, () => <Sub>[]).add(s);
+    }
+    final seen = <String>{};
+    for (final m in RegExp(r'[A-Za-z]+').allMatches(s.text)) {
+      seen.add(m.group(0)!.toLowerCase());
+    }
+    for (final w in seen) {
+      freq[w] = (freq[w] ?? 0) + 1;
+    }
+  }
+  var n = 0;
+  for (final e in pairs.entries) {
+    final wrong = e.key.substring(0, e.key.indexOf('>')).toLowerCase();
+    final f = freq[wrong] ?? 0;
+    if (e.value.length >= 3 && e.value.length >= 0.6 * f) {
+      for (final s in e.value) {
+        if (applySuggestion(s, e.key)) n++;
+      }
+    }
+  }
+  return n;
 }
 
 class ApplyStats {
@@ -1658,6 +1774,10 @@ ApplyStats applyReference(List<Sub> subs, List<Cue> cues, MatchResult r, {int ti
           }
         }
         s.trCov = trCoverage(s.text, trTxt);
+        if (go.length == 1 && gr.length == 1) {
+          s.sugg = suggestWordFixes(s.text, trTxt).map((p) => '${p[0]}>${p[1]}').toList();
+          if (s.sugg.isNotEmpty) s.warn.add('suggest');
+        }
       }
       final lr = norm(s.text).length / math.max(1, norm(s.refText ?? '').length);
       var odd = false;
