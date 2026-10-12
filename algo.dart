@@ -1014,11 +1014,54 @@ Stripped stripDomains(String text) {
 
 bool _plainLower(String t) => RegExp(r'^[a-z]+$').hasMatch(t);
 
+/// Buang tulisan kecil yang diam di tepi layar (logo/watermark) dan muncul di sangat banyak sampel,
+/// walau hasil bacanya berubah-ubah ("rajanime.com", "raiante. Cet", ...). Subtitle di tengah layar tidak tersentuh.
+int stripStaticEdge(List<Sample> samples) {
+  var nonEmpty = 0;
+  for (final s in samples) {
+    if (s.cands.isNotEmpty) nonEmpty++;
+  }
+  if (nonEmpty < 20) return 0;
+  bool edgeSmall(Cand c) {
+    final cx = (c.l + c.r) / 2;
+    final cy = (c.t + c.b) / 2;
+    return c.h <= 0.035 && (cx < 0.2 || cx > 0.8 || cy < 0.07 || cy > 0.95);
+  }
+
+  String key(Cand c) => '${(((c.l + c.r) / 2) / 0.08).floor()}:${(((c.t + c.b) / 2) / 0.08).floor()}';
+  final counts = <String, int>{};
+  for (final s in samples) {
+    final seen = <String>{};
+    for (final c in s.cands) {
+      if (edgeSmall(c)) seen.add(key(c));
+    }
+    for (final k in seen) {
+      counts[k] = (counts[k] ?? 0) + 1;
+    }
+  }
+  final need = math.max(15.0, 0.25 * nonEmpty);
+  final bad = <String>{for (final e in counts.entries) if (e.value >= need) e.key};
+  if (bad.isEmpty) return 0;
+  var removed = 0;
+  for (final s in samples) {
+    final keep = <Cand>[];
+    for (final c in s.cands) {
+      if (edgeSmall(c) && bad.contains(key(c))) {
+        removed++;
+      } else {
+        keep.add(c);
+      }
+    }
+    if (keep.length != s.cands.length) s.cands = keep;
+  }
+  return removed;
+}
+
 /// Hapus watermark dari semua sampel (mengubah in place): (1) pola alamat web, (2) token tak-biasa
 /// (HURUF BESAR / berangka / bertitik) yang selalu menempel di ujung baris pada banyak kalimat berbeda.
 /// Kata biasa (huruf kecil) tidak pernah dihapus oleh langkah (2). Mengembalikan jumlah baris yang diubah.
 int stripOverlays(List<Sample> samples) {
-  var changed = 0;
+  var changed = stripStaticEdge(samples);
   void shrink(Cand c, double cutL, double cutR) {
     final w = c.w;
     c.l += w * cutL;
