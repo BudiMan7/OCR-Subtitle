@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
+import 'package:google_mlkit_translation/google_mlkit_translation.dart';
 
 import 'algo.dart';
 
@@ -41,6 +42,7 @@ const Map<String, String> kWarn = {
   'bigshift': 'waktu bergeser >1,5 dtk dari hasil OCR',
   'missing': 'ada di referensi, tidak terbaca OCR',
   'recovered': 'hasil baca ulang, mohon dicek',
+  'trimmed': 'sisa watermark dibuang (dicocokkan dengan terjemahan referensi)',
 };
 
 String warnLabel(String w) => kWarn[w] ?? w;
@@ -170,6 +172,8 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
   String refName = '';
   String refStatus = '';
   double? refOffset;
+  bool trBusy = false;
+  String trStatus = '';
 
   // ---- proses ----
   bool running = false;
@@ -220,7 +224,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         refName = (j['name'] as String?) ?? '';
         refCues = (j['cues'] as List).map((e) {
           final l = e as List;
-          return Cue((l[0] as num).toDouble(), (l[1] as num).toDouble(), l[2] as String);
+          return Cue((l[0] as num).toDouble(), (l[1] as num).toDouble(), l[2] as String, l.length > 3 ? l[3] as String? : null);
         }).toList();
       }
     } catch (_) {}
@@ -386,12 +390,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         refName = r['name'] as String;
         refStatus = '';
       });
-      try {
-        await File('$filesDir/ref.json').writeAsString(jsonEncode({
-          'name': refName,
-          'cues': cues.map((c) => [c.start, c.end, c.text]).toList(),
-        }));
-      } catch (_) {}
+      await _saveRef();
       if (subs.isNotEmpty) {
         await _syncNow();
       } else {
@@ -402,12 +401,62 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     }
   }
 
+  Future<void> _saveRef() async {
+    try {
+      await File('$filesDir/ref.json').writeAsString(jsonEncode({
+        'name': refName,
+        'cues': refCues.map((c) => [c.start, c.end, c.text, c.tr]).toList(),
+      }));
+    } catch (_) {}
+  }
+
+  int get _trCount => refCues.where((c) => c.tr != null && c.tr!.isNotEmpty).length;
+
+  /// Terjemahkan referensi Inggris -> Indonesia di HP (ML Kit, gratis). Hasilnya hanya pembanding untuk teks OCR.
+  Future<void> translateRef() async {
+    if (refCues.isEmpty || trBusy) return;
+    setState(() {
+      trBusy = true;
+      trStatus = 'Menyiapkan model terjemahan (sekali saja, ±30 MB per bahasa, perlu internet)...';
+    });
+    try {
+      final mm = OnDeviceTranslatorModelManager();
+      for (final lang in [TranslateLanguage.english, TranslateLanguage.indonesian]) {
+        if (!await mm.isModelDownloaded(lang.bcpCode)) {
+          final ok = await mm.downloadModel(lang.bcpCode, isWifiRequired: false);
+          if (!ok) throw 'model ${lang.bcpCode} gagal diunduh';
+        }
+      }
+      final tr = OnDeviceTranslator(sourceLanguage: TranslateLanguage.english, targetLanguage: TranslateLanguage.indonesian);
+      try {
+        for (var i = 0; i < refCues.length; i++) {
+          final c = refCues[i];
+          if (c.tr != null) continue;
+          final t = c.text.replaceAll('\n', ' ').trim();
+          c.tr = t.isEmpty ? '' : await tr.translateText(t);
+          if (i % 20 == 0 && mounted) setState(() => trStatus = 'Menerjemahkan ${i + 1}/${refCues.length}...');
+        }
+      } finally {
+        await tr.close();
+      }
+      await _saveRef();
+      setState(() => trStatus = 'Terjemahan siap: $_trCount dialog.');
+      if (subs.isNotEmpty) await _syncNow();
+    } catch (e) {
+      await _saveRef();
+      if (mounted) setState(() => trStatus = 'Gagal menerjemahkan: $e');
+    } finally {
+      if (mounted) setState(() => trBusy = false);
+    }
+  }
+
   Future<void> clearRef() async {
     setState(() {
       refCues = [];
       refName = '';
       refStatus = '';
       refOffset = null;
+      trStatus = '';
     });
     try {
       final f = File('$filesDir/ref.json');
@@ -470,7 +519,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     final hs = els.map((e) => e.boundingBox.height).toList()..sort();
     final ref = hs[(hs.length * 3) ~/ 4];
     if (ref <= 0) return [_Ln(l.text, l.boundingBox, 0)];
-    final small = els.map((e) => e.boundingBox.height < 0.45 * ref).toList();
+    final small = els.map((e) => e.boundingBox.height < 0.62 * ref).toList();
     if (!small.contains(true) || !small.contains(false)) return [_Ln(l.text, l.boundingBox, 0)];
     final out = <_Ln>[];
     var group = <TextElement>[els.first];
@@ -656,6 +705,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         fill: st['fill'] ?? -1.0,
       );
       if (c.h < 0.012 || c.h > 0.25 || letterCount(c.text) < 2) continue;
+      if (isCornerMark(c)) continue; // watermark di sudut layar
       out.add(c);
     }
     return out;
@@ -1294,6 +1344,14 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
                   padding: const EdgeInsets.only(bottom: 4),
                   child: Text('Referensi (${fmtSrt(s.refStart ?? 0)}):\n${s.refText}', style: const TextStyle(fontStyle: FontStyle.italic)),
                 ),
+              if (s.refTr != null)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 4),
+                  child: Text('Terjemahan referensi (pembanding saja${s.trCov >= 0 ? ', ${(s.trCov * 100).round()}% kata cocok' : ''}):\n${s.refTr}',
+                      style: const TextStyle(fontStyle: FontStyle.italic, color: Colors.blueGrey)),
+                ),
+              if (s.rawText != null && s.rawText != s.text)
+                Text('Teks OCR sebelum dibersihkan: ${s.rawText!.replaceAll('\n', ' / ')}', style: const TextStyle(fontSize: 12)),
               if (s.origStart != null && ((s.origStart! - s.start).abs() > 0.01))
                 Text('Waktu OCR asli: ${fmtSrt(s.origStart!)} → ${fmtSrt(s.origEnd ?? s.origStart!)}', style: const TextStyle(fontSize: 12)),
               if (s.alt != null)
@@ -1580,6 +1638,20 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
             padding: const EdgeInsets.only(top: 8),
             child: Text('$refName\n${refCues.length} dialog • ${fmtClock(refCues.first.start)} – ${fmtClock(refCues.last.end)}'),
           ),
+        if (refCues.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: OutlinedButton.icon(
+              onPressed: (running || trBusy) ? null : translateRef,
+              icon: const Icon(Icons.translate),
+              label: Text(_trCount == refCues.length ? 'Terjemahan referensi sudah siap' : 'Terjemahkan referensi (gratis, offline)'),
+            ),
+          ),
+        if (trStatus.isNotEmpty) Padding(padding: const EdgeInsets.only(top: 4), child: Text(trStatus, style: const TextStyle(fontSize: 12))),
+        const Text(
+          'Terjemahan hanya jadi pembanding: kata yang cocok menaikkan keyakinan, dan sisa watermark di ujung baris yang tidak punya pasangan dibuang. Teks OCR tidak pernah diganti dengan terjemahan.',
+          style: TextStyle(fontSize: 12),
+        ),
         const SizedBox(height: 8),
         const Text('Garis waktu hasil:'),
         SegmentedButton<int>(
@@ -1593,7 +1665,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
         const SizedBox(height: 4),
         const Text(
           'Ikuti referensi: untuk dipakai pada video/rilis yang waktunya sama dengan SRT Inggris. Ikuti video: untuk dipakai pada video hardsub ini.\n'
-          'Waktu hanya dikoreksi untuk pasangan yang yakin, dan hanya jika kedua sumber tampak versi video yang sama. Teks Indonesia tidak pernah diterjemahkan atau diganti.',
+          'Waktu hanya dikoreksi untuk pasangan yang yakin, dan hanya jika kedua sumber tampak versi video yang sama. Teks hasil OCR tidak pernah diganti oleh referensi.',
           style: TextStyle(fontSize: 12),
         ),
         if (refCues.isNotEmpty)
