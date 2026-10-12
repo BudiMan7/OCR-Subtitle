@@ -462,6 +462,33 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
     return area <= 0 ? 0 : (i.width * i.height) / area;
   }
 
+  /// ML Kit kadang menggabungkan tulisan kecil (watermark) ke baris subtitle. Pisahkan kata-kata yang tingginya
+  /// jauh lebih kecil dari kata lain di baris yang sama menjadi baris tersendiri (lalu dinilai terpisah).
+  List<_Ln> _splitLine(TextLine l) {
+    final els = l.elements;
+    if (els.length < 2) return [_Ln(l.text, l.boundingBox, 0)];
+    final hs = els.map((e) => e.boundingBox.height).toList()..sort();
+    final ref = hs[(hs.length * 3) ~/ 4];
+    if (ref <= 0) return [_Ln(l.text, l.boundingBox, 0)];
+    final small = els.map((e) => e.boundingBox.height < 0.45 * ref).toList();
+    if (!small.contains(true) || !small.contains(false)) return [_Ln(l.text, l.boundingBox, 0)];
+    final out = <_Ln>[];
+    var group = <TextElement>[els.first];
+    for (var i = 1; i <= els.length; i++) {
+      if (i < els.length && small[i] == small[i - 1]) {
+        group.add(els[i]);
+        continue;
+      }
+      var r = group.first.boundingBox;
+      for (final e in group.skip(1)) {
+        r = r.expandToInclude(e.boundingBox);
+      }
+      out.add(_Ln(group.map((e) => e.text).join(' '), r, 0));
+      if (i < els.length) group = <TextElement>[els[i]];
+    }
+    return out;
+  }
+
   Future<List<_Ln>> _lines(OcrArea a, String path) async {
     final input = InputImage.fromFilePath(path);
     final out = <_Ln>[];
@@ -469,7 +496,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       final r = await _rec.processImage(input);
       for (final b in r.blocks) {
         for (final l in b.lines) {
-          out.add(_Ln(l.text, l.boundingBox, 0));
+          out.addAll(_splitLine(l));
         }
       }
       if (strictLatin && out.isNotEmpty) {
@@ -489,7 +516,7 @@ class _HomeState extends State<Home> with SingleTickerProviderStateMixin {
       final r = await _jp.processImage(input);
       for (final b in r.blocks) {
         for (final l in b.lines) {
-          out.add(_Ln(l.text, l.boundingBox, 0));
+          out.addAll(_splitLine(l));
         }
       }
     }
